@@ -406,6 +406,141 @@ pub struct SymbolInfo {
     pub fractional: bool,
 
     pub industry: Ustr,
+
+    /// Trading session in exchange time, e.g. `0900-1500` or `24x7`.
+    #[serde(deserialize_with = "lenient::ustr")]
+    pub session: Ustr,
+
+    /// Price scale. Prices move in steps of `minmov / pricescale`; see
+    /// [`SymbolInfo::tick_size`]. `0` when the server did not send it.
+    #[serde(deserialize_with = "lenient::u64")]
+    pub pricescale: u64,
+
+    /// Minimum price movement in units of `1 / pricescale`.
+    #[serde(deserialize_with = "lenient::u64")]
+    pub minmov: u64,
+
+    /// Fraction-of-a-fraction denominator for fractional price formats
+    /// (`0` for decimal prices). It affects formatting, not the tick size.
+    #[serde(deserialize_with = "lenient::u64")]
+    pub minmove2: u64,
+
+    /// Price-dependent tick sizes, e.g. `10 10000 50 50000 100`: tick 10
+    /// below 10000, tick 50 below 50000, tick 100 above. Empty when the tick
+    /// size is constant; see [`SymbolInfo::tick_size_at`].
+    #[serde(deserialize_with = "lenient::ustr")]
+    pub variable_tick_size: Ustr,
+
+    /// Currency value of a one-point price move for one contract (futures);
+    /// `1.0` for most stocks and crypto pairs, `0.0` when not sent.
+    #[serde(deserialize_with = "lenient::f64")]
+    pub pointvalue: f64,
+
+    /// Data delay in seconds (`900` for 15-minute delayed feeds, `0` for
+    /// real-time or when not sent).
+    #[serde(deserialize_with = "lenient::u64")]
+    pub delay: u64,
+
+    /// ISIN, when TradingView knows it.
+    #[serde(deserialize_with = "lenient::ustr")]
+    pub isin: Ustr,
+}
+
+impl SymbolInfo {
+    /// Minimum price increment, `minmov / pricescale`.
+    ///
+    /// Returns `None` when the server did not send a positive `pricescale`
+    /// and `minmov`. For symbols with a [`variable_tick_size`] this is the
+    /// tick at the price the server last saw; use [`Self::tick_size_at`] for
+    /// another price level.
+    ///
+    /// [`variable_tick_size`]: SymbolInfo::variable_tick_size
+    pub fn tick_size(&self) -> Option<f64> {
+        (self.pricescale > 0 && self.minmov > 0)
+            .then(|| self.minmov as f64 / self.pricescale as f64)
+    }
+
+    /// Tick size that applies at `price`.
+    ///
+    /// Uses [`variable_tick_size`] when it is set and well formed (tick,
+    /// upper bound, tick, upper bound, ..., tick, where a bound is exclusive)
+    /// and falls back to [`Self::tick_size`] otherwise.
+    ///
+    /// [`variable_tick_size`]: SymbolInfo::variable_tick_size
+    pub fn tick_size_at(&self, price: f64) -> Option<f64> {
+        let Some(levels) = parse_variable_tick_size(&self.variable_tick_size) else {
+            return self.tick_size();
+        };
+        levels.chunks(2).find_map(|level| match *level {
+            [tick, upper_bound] => (price < upper_bound).then_some(tick),
+            [tick] => Some(tick),
+            _ => None,
+        })
+    }
+}
+
+/// Parse `"t0 b0 t1 b1 ... tn"` into numbers. Returns `None` for an empty or
+/// malformed value: an even number of items, a non-numeric or non-positive
+/// item, or bounds that do not increase.
+fn parse_variable_tick_size(raw: &str) -> Option<Vec<f64>> {
+    let values = raw
+        .split_whitespace()
+        .map(|item| {
+            item.parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v > 0.0)
+        })
+        .collect::<Option<Vec<f64>>>()?;
+    if values.len() % 2 == 0 {
+        return None;
+    }
+    let bounds_increase = values
+        .iter()
+        .skip(1)
+        .step_by(2)
+        .zip(values.iter().skip(3).step_by(2))
+        .all(|(lower, upper)| lower < upper);
+    bounds_increase.then_some(values)
+}
+
+/// Deserializers that never fail on a value of an unexpected JSON type, so
+/// one odd metadata field cannot make the whole `symbol_resolved` payload
+/// unreadable. Unusable values become the field's default.
+mod lenient {
+    use serde::{Deserialize, Deserializer};
+    use serde_json::Value;
+    use ustr::Ustr;
+
+    pub(super) fn u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        Ok(match Value::deserialize(deserializer)? {
+            Value::Number(n) => n
+                .as_u64()
+                .or_else(|| {
+                    n.as_f64()
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .map(|v| v.round() as u64)
+                })
+                .unwrap_or_default(),
+            Value::String(s) => s.trim().parse().unwrap_or_default(),
+            _ => 0,
+        })
+    }
+
+    pub(super) fn f64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
+        Ok(match Value::deserialize(deserializer)? {
+            Value::Number(n) => n.as_f64().unwrap_or_default(),
+            Value::String(s) => s.trim().parse().unwrap_or_default(),
+            _ => 0.0,
+        })
+    }
+
+    pub(super) fn ustr<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Ustr, D::Error> {
+        Ok(match Value::deserialize(deserializer)? {
+            Value::String(s) => Ustr::from(&s),
+            Value::Number(n) => Ustr::from(&n.to_string()),
+            _ => Ustr::default(),
+        })
+    }
 }
 
 impl MarketSymbol for SymbolInfo {
@@ -718,6 +853,110 @@ mod tests {
     fn test_ohlcv_is_rising() {
         let rising = dp(1_700_000_000, 100.0, 105.0, 99.0, 102.0, 1000.0);
         assert!(rising.is_rising());
+    }
+
+    // ------------------------------------------------------------------
+    // SymbolInfo metadata
+    // ------------------------------------------------------------------
+
+    /// The `symbol_resolved` payload for HOSE:VCB in the recorded fixture.
+    fn fixture_symbol_info_value() -> Value {
+        let events: Vec<Value> =
+            serde_json::from_str(include_str!("../../tests/data/events.json")).unwrap();
+        events
+            .into_iter()
+            .find(|event| event["m"] == "symbol_resolved")
+            .map(|event| event["p"][2].clone())
+            .expect("fixture contains symbol_resolved")
+    }
+
+    #[test]
+    fn test_symbol_info_parses_metadata_from_fixture() {
+        let info = SymbolInfo::deserialize(&fixture_symbol_info_value()).unwrap();
+        assert_eq!(info.id, "HOSE:VCB");
+        assert_eq!(info.name, "VCB");
+        assert_eq!(info.exchange, "HOSE");
+        assert_eq!(info.pricescale, 1);
+        assert_eq!(info.minmov, 100);
+        assert_eq!(info.minmove2, 0);
+        assert_eq!(info.variable_tick_size, "10 10000 50 50000 100");
+        assert_eq!(info.pointvalue, 1.0);
+        assert_eq!(info.delay, 900);
+        assert_eq!(info.isin, "VN000000VCB4");
+        assert_eq!(info.session, "0900-1500");
+        assert_eq!(info.timezone, "Asia/Ho_Chi_Minh");
+        assert_eq!(info.currency_code, "VND");
+    }
+
+    #[test]
+    fn test_symbol_info_tick_size_from_fixture() {
+        let info = SymbolInfo::deserialize(&fixture_symbol_info_value()).unwrap();
+        assert_eq!(info.tick_size(), Some(100.0));
+        assert_eq!(info.tick_size_at(9_990.0), Some(10.0));
+        assert_eq!(info.tick_size_at(10_000.0), Some(50.0));
+        assert_eq!(info.tick_size_at(49_950.0), Some(50.0));
+        assert_eq!(info.tick_size_at(65_700.0), Some(100.0));
+    }
+
+    #[test]
+    fn test_symbol_info_tick_size_constant_and_missing() {
+        let crypto = SymbolInfo {
+            pricescale: 100,
+            minmov: 1,
+            ..Default::default()
+        };
+        assert_eq!(crypto.tick_size(), Some(0.01));
+        assert_eq!(crypto.tick_size_at(91_000.0), Some(0.01));
+
+        let single_level = SymbolInfo {
+            pricescale: 100,
+            minmov: 1,
+            variable_tick_size: Ustr::from("0.01"),
+            ..Default::default()
+        };
+        assert_eq!(single_level.tick_size_at(2.0), Some(0.01));
+
+        let malformed = SymbolInfo {
+            pricescale: 4,
+            minmov: 1,
+            variable_tick_size: Ustr::from("10 abc 50"),
+            ..Default::default()
+        };
+        assert_eq!(malformed.tick_size_at(5.0), Some(0.25));
+
+        let missing = SymbolInfo::default();
+        assert_eq!(missing.tick_size(), None);
+        assert_eq!(missing.tick_size_at(1.0), None);
+    }
+
+    #[test]
+    fn test_symbol_info_tolerates_unexpected_metadata_types() {
+        let mut value = fixture_symbol_info_value();
+        value["pricescale"] = Value::from("100");
+        value["minmov"] = Value::from(1.0);
+        value["minmove2"] = Value::Null;
+        value["delay"] = Value::from(-5);
+        value["pointvalue"] = Value::from("2.5");
+        value["isin"] = Value::Null;
+        value["session"] = Value::from(24);
+        let info = SymbolInfo::deserialize(&value).expect("lenient metadata parsing");
+        assert_eq!(info.pricescale, 100);
+        assert_eq!(info.minmov, 1);
+        assert_eq!(info.minmove2, 0);
+        assert_eq!(info.delay, 0);
+        assert_eq!(info.pointvalue, 2.5);
+        assert_eq!(info.isin, "");
+        assert_eq!(info.session, "24");
+        assert_eq!(info.tick_size(), Some(0.01));
+    }
+
+    #[test]
+    fn test_symbol_info_without_new_fields_keeps_defaults() {
+        let info: SymbolInfo =
+            serde_json::from_value(serde_json::json!({"pro_name": "X:Y", "name": "Y"})).unwrap();
+        assert_eq!(info.pricescale, 0);
+        assert_eq!(info.variable_tick_size, "");
+        assert_eq!(info.tick_size(), None);
     }
 
     #[test]

@@ -75,7 +75,34 @@ async def main():
 asyncio.run(main())
 ```
 
-### 2. Real-Time Quotes & Candlestick Streaming
+### 2. Deeper History, Adjustment and Symbol Metadata
+
+Pass `from_timestamp`, `max_bars` or `max_pages` (keyword-only) to page back with TradingView's `request_more_data`. Pagination stops at the target, at the start of the symbol's history, at the data server's bar limit, after `max_pages` pages, or on a page timeout; `series.pagination_stop` tells which.
+
+```python
+import datetime as dt
+from tradingview import DataServer, Interval, MarketAdjustment, SessionType, TradingViewClient
+
+client = TradingViewClient(server=DataServer.ProData)
+start = int(dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc).timestamp())
+
+series = await client.get_historical(
+    "VCB", "HOSE", Interval.OneHour,
+    from_timestamp=start,               # or max_bars=20_000, max_pages=5
+    page_delay=1.0,                     # seconds before each page (default 0.5)
+    adjustment=MarketAdjustment.Dividends,  # Splits (default), Dividends, Unadjusted
+    session_type=SessionType.Regular,   # Regular (default), Extended, PreMarket, PostMarket
+    currency=None,                      # e.g. "USD" to convert prices
+)
+print(len(series), series.pages_fetched, series.pagination_stop)
+
+info = series.symbol_info               # pricescale, minmov, variable_tick_size, delay, isin, session, timezone
+print(info.tick_size, info.tick_size_at(9_990))   # 100.0 10.0 for HOSE:VCB
+```
+
+The data server caps how far back any request reaches, with or without pagination: about 5,000 bars on the default `DataServer.Data` and about 10,000 on `DataServer.ProData` (measured 2026-11-19, the same anonymously and with a token). For example, 1-minute BINANCE:BTCUSDT reaches back about 4 days on `Data` and 11 days on `ProData`. See `docs/history-depth.md` in the repository. `get_historical_batch` accepts the same keywords and reuses at most `max_concurrency` connections.
+
+### 3. Real-Time Quotes & Candlestick Streaming
 
 ```python
 import asyncio
@@ -121,7 +148,7 @@ async def main():
 asyncio.run(main())
 ```
 
-### 3. Corporate Fundamentals & Economic Calendar
+### 4. Corporate Fundamentals & Economic Calendar
 
 ```python
 import asyncio
@@ -158,7 +185,7 @@ async def main():
 asyncio.run(main())
 ```
 
-### 4. ProData Server Endpoint & Entitlements
+### 5. ProData Server Endpoint & Entitlements
 
 ```python
 import asyncio
@@ -210,7 +237,7 @@ async def main():
 asyncio.run(main())
 ```
 
-### 5. Reuse a Login Across Runs (Cookie Persistence)
+### 6. Reuse a Login Across Runs (Cookie Persistence)
 
 ```python
 import asyncio

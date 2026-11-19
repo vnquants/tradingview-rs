@@ -19,10 +19,13 @@ fn _tradingview(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<models::enums::FinancialPeriod>()?;
     m.add_class::<models::enums::EconomicImportance>()?;
     m.add_class::<models::enums::DataServer>()?;
+    m.add_class::<models::enums::MarketAdjustment>()?;
+    m.add_class::<models::enums::SessionType>()?;
 
     // Register historical models
     m.add_class::<models::bar::Bar>()?;
     m.add_class::<models::bar::HistoricalSeries>()?;
+    m.add_class::<models::symbol::SymbolInfo>()?;
 
     // Register streaming models
     m.add_class::<models::quote::QuoteTick>()?;

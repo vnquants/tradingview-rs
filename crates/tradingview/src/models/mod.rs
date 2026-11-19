@@ -121,7 +121,11 @@ pub struct ChartDrawingSourceStatePoint {
 /// [`UserCookies::login`].
 ///
 /// Serialize to JSON for session persistence across restarts.
-#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+///
+/// `Debug` output redacts the auth token, session cookies, session hash,
+/// device token and private channel, so logging a `UserCookies` value does not
+/// leak secrets. Only `id`, `username` and whether each secret is set are shown.
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct UserCookies {
     pub id: u32,
     pub username: String,
@@ -134,6 +138,28 @@ pub struct UserCookies {
     pub session_hash: String,
     #[serde(default)]
     pub device_token: String,
+}
+
+impl std::fmt::Debug for UserCookies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn redact(value: &str) -> &'static str {
+            if value.is_empty() {
+                "<empty>"
+            } else {
+                "<redacted>"
+            }
+        }
+        f.debug_struct("UserCookies")
+            .field("id", &self.id)
+            .field("username", &self.username)
+            .field("private_channel", &redact(&self.private_channel))
+            .field("auth_token", &redact(&self.auth_token))
+            .field("session", &redact(&self.session))
+            .field("session_signature", &redact(&self.session_signature))
+            .field("session_hash", &redact(&self.session_hash))
+            .field("device_token", &redact(&self.device_token))
+            .finish()
+    }
 }
 
 /// Response from the TradingView symbol search endpoint.
@@ -253,15 +279,20 @@ impl Display for SessionType {
 
 /// Data adjustment applied to historical OHLCV bars.
 ///
-/// When `Splits`, prices are adjusted for stock splits. When `Dividends`,
-/// prices are adjusted for dividend payments.
-#[derive(Debug, Default, Clone, Deserialize, Serialize, Copy)]
+/// Sent as the `adjustment` key of the symbol request. When it is omitted,
+/// TradingView applies [`MarketAdjustment::Splits`]: on 2026-11-19 HOSE:VCB
+/// daily bars were identical with no adjustment key and with `splits`.
+/// Symbols whose `allowed_adjustment` is `none` (for example crypto pairs)
+/// return the same bars for every variant.
+#[derive(Debug, Default, Clone, Deserialize, Serialize, Copy, PartialEq, Eq, Hash)]
 pub enum MarketAdjustment {
-    /// Adjust for stock splits.
+    /// Adjust for stock splits and stock dividends (the server default).
     #[default]
     Splits,
-    /// Adjust for dividend payments.
+    /// Adjust for splits and cash dividends (back-adjusted prices).
     Dividends,
+    /// Raw traded prices without any adjustment (wire value `none`).
+    Unadjusted,
 }
 
 impl Display for MarketAdjustment {
@@ -269,6 +300,7 @@ impl Display for MarketAdjustment {
         match self {
             MarketAdjustment::Splits => write!(f, "splits"),
             MarketAdjustment::Dividends => write!(f, "dividends"),
+            MarketAdjustment::Unadjusted => write!(f, "none"),
         }
     }
 }
@@ -1502,6 +1534,47 @@ impl std::ops::Index<&str> for TechnicalAnalysis {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_user_cookies_debug_redacts_secrets() {
+        let cookies = UserCookies {
+            id: 42,
+            username: "alice".to_string(),
+            private_channel: "private-channel-secret".to_string(),
+            auth_token: "auth-token-secret".to_string(),
+            session: "session-cookie-secret".to_string(),
+            session_signature: "session-signature-secret".to_string(),
+            session_hash: "session-hash-secret".to_string(),
+            device_token: String::new(),
+        };
+
+        for rendered in [format!("{cookies:?}"), format!("{cookies:#?}")] {
+            for secret in [
+                "private-channel-secret",
+                "auth-token-secret",
+                "session-cookie-secret",
+                "session-signature-secret",
+                "session-hash-secret",
+            ] {
+                assert!(
+                    !rendered.contains(secret),
+                    "Debug output leaked {secret}: {rendered}"
+                );
+            }
+            assert!(rendered.contains("alice"));
+            assert!(rendered.contains("42"));
+            assert!(rendered.contains("<redacted>"));
+            assert!(rendered.contains("device_token: \"<empty>\""));
+        }
+    }
+
+    #[test]
+    fn test_market_adjustment_wire_values() {
+        assert_eq!(MarketAdjustment::Splits.to_string(), "splits");
+        assert_eq!(MarketAdjustment::Dividends.to_string(), "dividends");
+        assert_eq!(MarketAdjustment::Unadjusted.to_string(), "none");
+        assert_eq!(MarketAdjustment::default(), MarketAdjustment::Splits);
+    }
 
     #[test]
     fn test_symbol_id_prefers_prefix_over_exchange() {

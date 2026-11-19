@@ -2605,7 +2605,7 @@ dependencies = [
 
 [[package]]
 name = "tradingview-py"
-version = "0.4.6"
+version = "0.4.7"
 dependencies = [
  "chrono",
  "futures-util",

@@ -71,6 +71,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Pagination, adjustment, session and currency
+
+`HistoricalRequest` pages back with `request_more_data` when `from_timestamp`,
+`max_bars` or `max_pages` is set. `page_size` (default 5,000 bars) and
+`page_delay` (default 500 ms) shape each page; `timeout` applies to the initial
+load and to each page. `HistoricalResult::pages_fetched` and
+`HistoricalResult::pagination_stop` (`PaginationStop::{ReachedFrom,
+ReachedMaxBars, MaxPages, EndOfHistory, BarLimit, NoMoreData, Timeout}`) report
+the walk. A page timeout returns the bars received so far; an initial timeout is
+an error. The data server's bar limit caps the depth (see
+[`history-depth.md`](history-depth.md)).
+
+```rust
+use std::time::Duration;
+use tradingview::historical::{BatchConfig, HistoricalClient, HistoricalRequest};
+use tradingview::{Currency, DataServer, Interval, MarketAdjustment, SessionType};
+
+# async fn run() -> tradingview::Result<()> {
+let client = HistoricalClient::new("unauthorized_user_token", DataServer::ProData);
+let request = HistoricalRequest::builder()
+    .symbol("VCB".to_string())
+    .exchange("HOSE".to_string())
+    .interval(Interval::OneHour)
+    .from_timestamp(1_735_689_600) // 2025-01-01T00:00:00Z
+    .page_delay(Duration::from_secs(1))
+    .adjustment(MarketAdjustment::Unadjusted) // Splits is the server default
+    .session_type(SessionType::Regular)
+    .currency(Currency::USD)
+    .build();
+let result = client.retrieve(request).await?;
+println!(
+    "{} bars, {} pages, stop={:?}, tick={:?}",
+    result.len(),
+    result.pages_fetched,
+    result.pagination_stop,
+    result.symbol_info.tick_size(),
+);
+
+// The same options for many symbols: at most `max_concurrency` connections,
+// each fetching its share of the symbols in turn.
+let symbols = vec![("BTCUSDT".to_string(), "BINANCE".to_string())];
+let template = HistoricalRequest::builder()
+    .interval(Interval::OneMinute)
+    .max_bars(10_000)
+    .build();
+let batch = client
+    .retrieve_batch_with(&symbols, &template, BatchConfig::default())
+    .await;
+# Ok(())
+# }
+```
+
+`SymbolInfo` now keeps `session`, `pricescale`, `minmov`, `minmove2`,
+`variable_tick_size`, `pointvalue`, `delay` and `isin` from `symbol_resolved`
+(`timezone` was already kept). `SymbolInfo::tick_size()` returns
+`minmov / pricescale`, and `SymbolInfo::tick_size_at(price)` applies
+`variable_tick_size` (for HOSE:VCB, `"10 10000 50 50000 100"`: tick 10 below
+10,000, 50 below 50,000, 100 above).
+
+`ChartOptions` accepts `.`, `!`, `_`, `-` and `&` in exchange and symbol names,
+so `OKX:BTCUSDT.P`, `HNX:VN30F1!`, `FX_IDC:USDVND` and `NSE:M&M` validate.
+
 ---
 
 ## WebSocket & Quote Streaming

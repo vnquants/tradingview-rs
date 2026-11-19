@@ -2,7 +2,7 @@
 
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from enum import Enum
-from typing import Any, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 from tradingview.exceptions import (
     AuthenticationError,
@@ -54,6 +54,93 @@ class DataServer(Enum):
     ProData = "prodata"
     WidgetData = "widgetdata"
     MobileData = "mobile-data"
+
+class MarketAdjustment(Enum):
+    """Price adjustment applied to historical bars.
+
+    Without an adjustment TradingView applies `Splits`. Symbols that do not
+    support adjustments (for example crypto pairs) return the same bars for
+    every value.
+    """
+
+    Splits = "splits"
+    """Adjust for splits and stock dividends (the server default)."""
+    Dividends = "dividends"
+    """Adjust for splits and cash dividends (back-adjusted prices)."""
+    Unadjusted = "none"
+    """Raw traded prices without any adjustment."""
+
+class SessionType(Enum):
+    """Trading session of historical bars. Without a session TradingView returns `Regular`."""
+
+    Regular = "regular"
+    Extended = "extended"
+    """Regular hours plus pre- and post-market."""
+    PreMarket = "premarket"
+    PostMarket = "postmarket"
+
+PaginationStop: TypeAlias = Literal[
+    "reached_from",
+    "reached_max_bars",
+    "max_pages",
+    "end_of_history",
+    "bar_limit",
+    "no_more_data",
+    "timeout",
+]
+"""Why pagination stopped walking back (`HistoricalSeries.pagination_stop`)."""
+
+class SymbolInfo:
+    """Symbol metadata returned by TradingView with historical bars."""
+
+    id: str
+    """Full TradingView id, e.g. `HOSE:VCB`."""
+    name: str
+    exchange: str
+    listed_exchange: str
+    description: str
+    market_type: str
+    """TradingView instrument type, e.g. `stock`, `spot`, `swap`, `futures`."""
+    currency_code: str
+    timezone: str
+    session: str
+    """Trading session in exchange time, e.g. `0900-1500` or `24x7`."""
+    pricescale: int
+    minmov: int
+    minmove2: int
+    variable_tick_size: str
+    """Price-dependent tick sizes such as `10 10000 50 50000 100`; empty when constant."""
+    pointvalue: float
+    delay: int
+    """Data delay in seconds (0 for real-time)."""
+    isin: str
+
+    def __init__(
+        self,
+        id: str = "",
+        name: str = "",
+        exchange: str = "",
+        *,
+        listed_exchange: str = "",
+        description: str = "",
+        market_type: str = "",
+        currency_code: str = "",
+        timezone: str = "",
+        session: str = "",
+        pricescale: int = 0,
+        minmov: int = 0,
+        minmove2: int = 0,
+        variable_tick_size: str = "",
+        pointvalue: float = 0.0,
+        delay: int = 0,
+        isin: str = "",
+    ) -> None: ...
+    @property
+    def tick_size(self) -> float | None:
+        """Minimum price increment `minmov / pricescale`, or None when unknown."""
+    def tick_size_at(self, price: float) -> float | None:
+        """Tick size at `price`, using `variable_tick_size` when it is set."""
+    def to_dict(self) -> dict[str, Any]: ...
 
 class Bar:
     """Individual historical OHLCV price bar."""
@@ -110,6 +197,12 @@ class HistoricalSeries:
     exchange: str
     interval: Interval
     bars: list[Bar]
+    symbol_info: SymbolInfo | None
+    """Symbol metadata from TradingView, when the series came from the server."""
+    pages_fetched: int
+    """Number of `request_more_data` pages sent (0 without pagination)."""
+    pagination_stop: PaginationStop | None
+    """Why pagination stopped, or None without pagination."""
 
     def __init__(
         self,
@@ -117,6 +210,10 @@ class HistoricalSeries:
         exchange: str,
         interval: Interval,
         bars: list[Bar],
+        *,
+        symbol_info: SymbolInfo | None = None,
+        pages_fetched: int = 0,
+        pagination_stop: str | None = None,
     ) -> None: ...
     def __len__(self) -> int: ...
     def __getitem__(self, index: int) -> Bar: ...
@@ -350,32 +447,94 @@ class TradingViewClient:
         symbol: str,
         exchange: str,
         interval: Interval = Interval.OneDay,
-        n_bars: int = 100,
+        n_bars: int | None = None,
         with_replay: bool = False,
         as_dataframe: bool = False,
         *,
         server: DataServer | None = None,
-    ) -> Any: ...
+        from_timestamp: int | None = None,
+        max_bars: int | None = None,
+        max_pages: int | None = None,
+        page_size: int = 5000,
+        page_delay: float = 0.5,
+        adjustment: MarketAdjustment | None = None,
+        session_type: SessionType | None = None,
+        currency: str | None = None,
+    ) -> Any:
+        """Fetch OHLCV bars for one symbol.
+
+        Returns a `HistoricalSeries`, or a Polars DataFrame when `as_dataframe=True`.
+
+        Args:
+            n_bars: Bars in the first request. Defaults to 100 without pagination
+                and to `page_size` (capped at `max_bars`) with pagination.
+            with_replay: Has no effect; kept for compatibility.
+            server: Data server override. `DataServer.ProData` serves about twice
+                as many bars as the default `DataServer.Data`.
+            from_timestamp: Oldest bar wanted (Unix seconds). Enables pagination;
+                older bars are dropped from the result.
+            max_bars: Bars wanted in total. Enables pagination; only the newest
+                `max_bars` bars are returned.
+            max_pages: Maximum `request_more_data` pages (default 100 when
+                pagination is enabled by another keyword). Enables pagination on its own.
+            page_size: Bars requested per page.
+            page_delay: Seconds to wait before each page.
+            adjustment: Price adjustment; the server default is `Splits`.
+            session_type: Trading session; the server default is `Regular`.
+            currency: ISO 4217 code to convert prices to, e.g. `"USD"`.
+
+        Pagination stops at `from_timestamp` or `max_bars`, when the server reports
+        the start of history or its bar limit, when a page adds no older bar,
+        after `max_pages` pages, or when a page times out (the bars received so far
+        are returned). See `HistoricalSeries.pagination_stop`.
+
+        Raises:
+            ValueError: If `page_size` or `max_bars` is 0, `page_delay` is negative,
+                or `currency` is not an ISO 4217 code.
+        """
     async def get_historical_df(
         self,
         symbol: str,
         exchange: str,
         interval: Interval = Interval.OneDay,
-        n_bars: int = 100,
+        n_bars: int | None = None,
         with_replay: bool = False,
         *,
         server: DataServer | None = None,
-    ) -> Any: ...
+        from_timestamp: int | None = None,
+        max_bars: int | None = None,
+        max_pages: int | None = None,
+        page_size: int = 5000,
+        page_delay: float = 0.5,
+        adjustment: MarketAdjustment | None = None,
+        session_type: SessionType | None = None,
+        currency: str | None = None,
+    ) -> Any:
+        """`get_historical(..., as_dataframe=True)`: return a Polars DataFrame."""
     async def get_historical_batch(
         self,
         symbols: Sequence[tuple[str, str]],
         interval: Interval = Interval.OneDay,
-        n_bars: int = 100,
+        n_bars: int | None = None,
         max_concurrency: int = 4,
         as_dataframe: bool = False,
         *,
         server: DataServer | None = None,
-    ) -> Any: ...
+        from_timestamp: int | None = None,
+        max_bars: int | None = None,
+        max_pages: int | None = None,
+        page_size: int = 5000,
+        page_delay: float = 0.5,
+        adjustment: MarketAdjustment | None = None,
+        session_type: SessionType | None = None,
+        currency: str | None = None,
+    ) -> Any:
+        """Fetch several `(symbol, exchange)` pairs; keys are `"EXCHANGE:SYMBOL"`.
+
+        Takes the keywords of `get_historical`. At most `max_concurrency`
+        WebSocket connections are opened; each fetches its share of the symbols
+        one after another. Symbols that fail are left out of the result.
+        """
     async def subscribe_quotes(
         self,
         symbols: Sequence[str],
@@ -426,10 +585,13 @@ __all__ = [
     "FundamentalSeries",
     "HistoricalSeries",
     "Interval",
+    "MarketAdjustment",
     "ProtocolError",
     "QuoteSubscription",
     "QuoteTick",
     "RateLimitError",
+    "SessionType",
+    "SymbolInfo",
     "SymbolNotFoundError",
     "TimeoutError",
     "TradingViewClient",

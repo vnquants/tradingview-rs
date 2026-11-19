@@ -17,6 +17,13 @@ pub struct HistoricalState {
     pub first_data_at: Option<Instant>,
     pub total_bars: usize,
     pub notify: Arc<tokio::sync::Notify>,
+    /// Number of `series_completed` messages received: one for the initial
+    /// load and one per `request_more_data` page.
+    pub completions: u64,
+    /// `data_completed` value of the latest `series_completed` message:
+    /// `"end"` at the start of the symbol's history, `"limit"` at the
+    /// session's bar limit, `None` while more data can be requested.
+    pub data_completed: Option<String>,
 }
 
 impl HistoricalState {
@@ -36,6 +43,8 @@ impl HistoricalState {
             first_data_at: None,
             total_bars: 0,
             notify,
+            completions: 0,
+            data_completed: None,
         }
     }
     pub fn with_capacity(capacity: usize) -> Self {
@@ -74,7 +83,13 @@ impl HistoricalState {
         self.error_count > 5
     }
     pub fn complete(&mut self) {
+        self.complete_series(None);
+    }
+    /// Record a `series_completed` message and wake waiters.
+    pub fn complete_series(&mut self, data_completed: Option<String>) {
         self.completed = true;
+        self.completions += 1;
+        self.data_completed = data_completed;
         self.notify.notify_waiters();
     }
     pub fn fail(&mut self, msg: String) {
@@ -85,9 +100,30 @@ impl HistoricalState {
     pub fn is_done(&self) -> bool {
         self.completed || self.errored
     }
+    /// Sort the bars by timestamp and keep one bar per timestamp, the one
+    /// received last (a later real-time update replaces an earlier value).
+    pub fn normalize(&mut self) {
+        // Stable sort keeps arrival order among equal timestamps.
+        self.data.sort_by_key(|point| point.timestamp());
+        let mut deduped: Vec<DataPoint> = Vec::with_capacity(self.data.len());
+        for point in self.data.drain(..) {
+            match deduped.last_mut() {
+                Some(last) if last.timestamp() == point.timestamp() => *last = point,
+                _ => deduped.push(point),
+            }
+        }
+        self.data = deduped;
+    }
+    /// Number of distinct bars and the oldest timestamp, after [`Self::normalize`].
+    pub fn bar_count_and_earliest(&mut self) -> (usize, Option<i64>) {
+        self.normalize();
+        (
+            self.data.len(),
+            self.data.first().map(|point| point.timestamp()),
+        )
+    }
     pub fn finalize(&mut self) -> Vec<DataPoint> {
-        self.data.sort_by_key(|a| a.timestamp());
-        self.data.dedup_by_key(|p| p.timestamp());
+        self.normalize();
         std::mem::take(&mut self.data)
     }
 }
@@ -116,5 +152,53 @@ impl ReplayState {
     }
     pub fn needs_setup(&self) -> bool {
         self.enabled && !self.configured && self.data_received
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bar(ts: i64, close: f64) -> DataPoint {
+        DataPoint {
+            index: 0,
+            value: vec![ts as f64, close, close, close, close, 1.0],
+        }
+    }
+
+    #[test]
+    fn test_finalize_sorts_and_keeps_latest_value_per_timestamp() {
+        let mut state = HistoricalState::new();
+        state.record_points(vec![bar(300, 3.0), bar(100, 1.0), bar(200, 2.0)], 3);
+        // A real-time update for the newest bar, then an overlapping older page.
+        state.record_points(vec![bar(300, 3.5)], 1);
+        state.record_points(vec![bar(50, 0.5), bar(100, 1.0)], 2);
+
+        let data = state.finalize();
+        let timestamps: Vec<i64> = data.iter().map(|p| p.timestamp()).collect();
+        assert_eq!(timestamps, vec![50, 100, 200, 300]);
+        assert_eq!(data[3].close(), 3.5, "latest update must win");
+        assert_eq!(state.total_bars, 6);
+        assert!(state.data.is_empty());
+    }
+
+    #[test]
+    fn test_bar_count_and_earliest() {
+        let mut state = HistoricalState::new();
+        assert_eq!(state.bar_count_and_earliest(), (0, None));
+        state.record_points(vec![bar(200, 2.0), bar(100, 1.0), bar(200, 2.1)], 3);
+        assert_eq!(state.bar_count_and_earliest(), (2, Some(100)));
+    }
+
+    #[test]
+    fn test_complete_series_counts_completions() {
+        let mut state = HistoricalState::new();
+        state.complete();
+        assert_eq!(state.completions, 1);
+        assert_eq!(state.data_completed, None);
+        state.complete_series(Some("limit".to_string()));
+        assert_eq!(state.completions, 2);
+        assert!(state.completed);
+        assert_eq!(state.data_completed.as_deref(), Some("limit"));
     }
 }
