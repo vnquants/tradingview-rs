@@ -210,6 +210,40 @@ async def main():
 asyncio.run(main())
 ```
 
+### 5. Reuse a Login Across Runs (Cookie Persistence)
+
+```python
+import asyncio
+import os
+from pathlib import Path
+from tradingview import TradingViewClient
+
+COOKIES = Path("cookies.json")  # keep out of git; holds live session secrets
+
+
+async def main():
+    if COOKIES.exists():
+        # No password login: rebuild the cookie session saved by an earlier run.
+        client = TradingViewClient.from_cookies(COOKIES.read_text())
+    else:
+        client = await TradingViewClient.login(
+            username=os.environ["TRADINGVIEW_USERNAME"],
+            password=os.environ["TRADINGVIEW_PASSWORD"],
+            totp_secret=os.environ.get("TRADINGVIEW_TOTP_SECRET"),
+        )
+        fd = os.open(COOKIES, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(client.export_cookies())
+
+    token = await client.get_tradingview_token()
+    print(f"token length: {len(token)}")
+
+
+asyncio.run(main())
+```
+
+`from_cookies()` makes no network request and needs only `session` and `session_signature`. If TradingView has expired the session, `get_tradingview_token()` raises `AuthenticationError`; log in again and overwrite the file.
+
 ---
 
 ## License

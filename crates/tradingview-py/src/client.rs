@@ -1,10 +1,12 @@
 use parking_lot::RwLock;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use pyo3_async_runtimes::tokio::future_into_py;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::debug;
 use tradingview::chart::OHLCV;
 use tradingview::historical::{BatchConfig, HistoricalClient, HistoricalRequest};
 use tradingview::live::models::DataServer as CoreDataServer;
@@ -20,6 +22,7 @@ use crate::models::candle::{BarSubscription, CandleUpdate};
 use crate::models::enums::{DataServer, EconomicImportance, FinancialPeriod, Interval};
 use crate::models::fundamental::{FundamentalPoint, FundamentalSeries};
 use crate::models::quote::{QuoteSubscription, QuoteTick};
+use crate::session::{CookieImportError, export_user_cookies, parse_user_cookies};
 use crate::streaming::{CandleStreamHandler, QuoteStreamHandler};
 
 /// Main client interface for accessing TradingView market data.
@@ -153,16 +156,71 @@ impl TradingViewClient {
             Ok(())
         })
     }
+    /// Build a cookie-session client from JSON produced by `export_cookies()`.
+    ///
+    /// No network request is made. The returned client can call `get_tradingview_token()`
+    /// without a password login. Only `session` and `session_signature` are required;
+    /// the other `UserCookies` fields may be omitted. The stored `auth_token` is restored
+    /// as-is and may already have expired.
+    ///
+    /// Raises `ValueError` for malformed JSON and `AuthenticationError` when the session
+    /// cookies are empty. Error messages never include cookie or token values.
+    #[classmethod]
+    #[pyo3(signature = (cookies_json, *, server = DataServer::Data))]
+    pub fn from_cookies(
+        _cls: &Bound<'_, PyType>,
+        cookies_json: &str,
+        server: DataServer,
+    ) -> PyResult<Self> {
+        let cookies = parse_user_cookies(cookies_json).map_err(|err| match err {
+            CookieImportError::MissingSessionCookies => {
+                AuthenticationError::new_err(err.to_string())
+            }
+            CookieImportError::Malformed { .. } | CookieImportError::NotAnObject => {
+                PyValueError::new_err(err.to_string())
+            }
+        })?;
+        debug!(
+            has_auth_token = !cookies.auth_token.is_empty(),
+            has_device_token = !cookies.device_token.is_empty(),
+            "restored TradingView cookie session"
+        );
+
+        let non_empty = |value: &str| (!value.is_empty()).then(|| value.to_string());
+        Ok(Self {
+            auth_token: Arc::new(RwLock::new(non_empty(&cookies.auth_token))),
+            username: Arc::new(RwLock::new(non_empty(&cookies.username))),
+            user_cookies: Arc::new(RwLock::new(Some(cookies))),
+            server,
+        })
+    }
+
+    /// Export the session cookies as JSON so a later process can call `from_cookies()`.
+    ///
+    /// The JSON contains live session secrets: store it with owner-only permissions.
+    /// Raises `AuthenticationError` if the client has no cookie session (anonymous or
+    /// token-only clients).
+    pub fn export_cookies(&self) -> PyResult<String> {
+        let guard = self.user_cookies.read();
+        let cookies = guard.as_ref().ok_or_else(|| {
+            AuthenticationError::new_err(
+                "Client has no cookie session to export; authenticate via login(), authenticate() or from_cookies() first",
+            )
+        })?;
+        export_user_cookies(cookies)
+            .map_err(|_| PyValueError::new_err("failed to serialize the cookie session"))
+    }
+
     /// Retrieve a TradingView session token using authenticated session cookies.
     ///
-    /// Requires an active cookie session obtained via `login()` or `authenticate()`.
+    /// Requires an active cookie session obtained via `login()`, `authenticate()` or `from_cookies()`.
     /// Anonymous or token-only clients will raise `AuthenticationError` before making network calls.
     pub fn get_tradingview_token<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let cookies_opt = self.user_cookies.read().clone();
         future_into_py(py, async move {
             let cookies = cookies_opt.ok_or_else(|| {
                 AuthenticationError::new_err(
-                    "Client must be authenticated via login() or authenticate() with session cookies to retrieve a TradingView token; a supplied auth_token is not a cookie session",
+                    "Client must be authenticated via login(), authenticate() or from_cookies() with session cookies to retrieve a TradingView token; a supplied auth_token is not a cookie session",
                 )
             })?;
 

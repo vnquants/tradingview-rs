@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Python binding 0.4.6: `TradingViewClient.export_cookies()` returns the session cookies as the JSON that Rust `UserCookies` serializes to, and `TradingViewClient.from_cookies(cookies_json, *, server=...)` rebuilds a cookie-session client from it without a network request, so `get_tradingview_token()` works across processes without a new password login. Only `session` and `session_signature` are required on import; malformed JSON raises `ValueError` and empty session cookies raise `AuthenticationError`, and neither message includes cookie values.
 - Published PyPI wheels for Linux (x86_64, aarch64) with glibc 2.28 or newer, macOS (x86_64, arm64), and Windows (x86_64), plus a source distribution. Previously only a Linux x86_64 wheel requiring glibc 2.38 was published.
 
 ## [0.4.5] - 2026-11-07
