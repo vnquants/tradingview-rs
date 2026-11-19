@@ -7,7 +7,8 @@
 use crate::{
     Interval,
     historical::{
-        HistoricalClient, HistoricalRequest, HistoricalResult, client::HistoricalConnection,
+        HistoricalClient, HistoricalRequest, HistoricalResult,
+        client::{HistoricalConnection, is_connection_error},
     },
 };
 use std::collections::VecDeque;
@@ -42,7 +43,10 @@ pub struct BatchConfig {
     /// **Default: 4.**  Higher values may trigger TradingView rate-limiting.
     pub max_concurrency: usize,
 
-    /// Timeout per individual symbol fetch.
+    /// Time allowed for each wait of one symbol's fetch: connecting, the
+    /// initial series load, and each pagination page separately. It replaces
+    /// the template's `timeout`, so a paginated symbol can take longer than
+    /// this in total.
     ///
     /// **Default: 30 seconds.**
     pub per_symbol_timeout: std::time::Duration,
@@ -149,9 +153,11 @@ impl HistoricalClient {
     /// `config.per_symbol_timeout` replaces its `timeout`. At most
     /// `config.max_concurrency` WebSocket connections are opened (at least
     /// one, never more than there are symbols); each connection fetches
-    /// symbols one after another in separate chart sessions and is replaced
-    /// after a failed fetch. The call returns when every symbol succeeded or
-    /// failed.
+    /// symbols one after another in separate chart sessions. A connection is
+    /// replaced after a connection failure or a timeout, and a symbol whose
+    /// fetch failed because the connection closed or could not be opened is
+    /// retried once on a fresh connection. The call returns when every symbol
+    /// succeeded or failed.
     ///
     /// # Example
     ///
@@ -202,6 +208,7 @@ impl HistoricalClient {
                 id: worker,
                 auth_token: self.auth_token.clone(),
                 server: self.server,
+                endpoint: self.endpoint.clone(),
                 template: template.clone(),
                 queue: Arc::clone(&queue),
                 results: result_tx.clone(),
@@ -262,6 +269,7 @@ struct BatchWorker {
     id: usize,
     auth_token: String,
     server: crate::DataServer,
+    endpoint: Option<url::Url>,
     template: HistoricalRequest,
     queue: Arc<Mutex<VecDeque<(String, String)>>>,
     results: mpsc::UnboundedSender<BatchSymbolResult>,
@@ -282,15 +290,33 @@ impl BatchWorker {
                 "Fetching historical data"
             );
             let request = self.template.for_symbol(&symbol, &exchange);
-            let result = match self.connection(&mut connection).await {
-                Ok(open) => open.fetch(&request).await,
-                Err(error) => Err(error),
+            let mut retried = false;
+            let result = loop {
+                let result = match self.connection(&mut connection).await {
+                    Ok(open) => open.fetch(&request).await,
+                    Err(error) => Err(error),
+                };
+                let Err(error) = &result else {
+                    break result;
+                };
+                let connection_failed = is_connection_error(error);
+                if (connection_failed || matches!(error, crate::Error::Timeout(_)))
+                    && let Some(failed) = connection.take()
+                {
+                    failed.close().await;
+                }
+                if connection_failed && !retried {
+                    retried = true;
+                    warn!(
+                        worker = self.id,
+                        symbol = %symbol,
+                        error = %error,
+                        "Connection failed; retrying the symbol once on a new connection"
+                    );
+                    continue;
+                }
+                break result;
             };
-            if result.is_err()
-                && let Some(failed) = connection.take()
-            {
-                failed.close().await;
-            }
             // The receiver lives until every worker finished.
             let _ = self.results.send(BatchSymbolResult {
                 symbol,
@@ -312,7 +338,15 @@ impl BatchWorker {
             stale.close().await;
         }
         if slot.is_none() {
-            *slot = Some(HistoricalConnection::open(&self.auth_token, self.server).await?);
+            *slot = Some(
+                HistoricalConnection::open(
+                    &self.auth_token,
+                    self.server,
+                    self.endpoint.as_ref(),
+                    self.template.timeout,
+                )
+                .await?,
+            );
         }
         Ok(slot.as_ref().expect("connection was opened above"))
     }

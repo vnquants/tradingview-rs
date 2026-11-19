@@ -94,13 +94,15 @@ series = await client.get_historical(
     session_type=SessionType.Regular,   # Regular (default), Extended, PreMarket, PostMarket
     currency=None,                      # e.g. "USD" to convert prices
 )
-print(len(series), series.pages_fetched, series.pagination_stop)
+print(len(series), series.pages_fetched, series.pagination_stop, series.is_complete)
 
 info = series.symbol_info               # pricescale, minmov, variable_tick_size, delay, isin, session, timezone
 print(info.tick_size, info.tick_size_at(9_990))   # 100.0 10.0 for HOSE:VCB
 ```
 
-The data server caps how far back any request reaches, with or without pagination: about 5,000 bars on the default `DataServer.Data` and about 10,000 on `DataServer.ProData` (measured 2026-11-19, the same anonymously and with a token). For example, 1-minute BINANCE:BTCUSDT reaches back about 4 days on `Data` and 11 days on `ProData`. See `docs/history-depth.md` in the repository. `get_historical_batch` accepts the same keywords and reuses at most `max_concurrency` connections.
+The data server caps how far back any request reaches, with or without pagination: about 5,000-8,000 bars on the default `DataServer.Data` and about 10,000-16,500 on `DataServer.ProData` (measured 2026-11-19, the same anonymously and with a token). For example, 1-minute BINANCE:BTCUSDT reaches back about 4 days on `Data` and 11 days on `ProData`. See `docs/history-depth.md` in the repository. `get_historical_batch` accepts the same keywords, reuses at most `max_concurrency` connections, and returns a `HistoricalBatch` dict whose `.failed` lists the symbols that failed.
+
+A page timeout raises `TimeoutError` and a closed connection raises `ConnectionError` unless `allow_partial=True`. DataFrame results cannot carry `pagination_stop`, so `get_historical_df` raises `IncompleteHistoryError` for an incomplete history (for example at the bar limit) unless `allow_partial=True`. `drop_incomplete_last_bar=True` drops a still-forming newest bar. Invalid keywords raise `ValueError` when the method is called.
 
 ### 3. Real-Time Quotes & Candlestick Streaming
 

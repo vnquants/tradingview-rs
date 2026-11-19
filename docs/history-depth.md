@@ -9,13 +9,15 @@ cannot reach.
 
 - The depth is capped by the **data server**, not by pagination and not by the
   session: anonymous and token sessions returned identical results on each
-  server. `DataServer::Data`, `WidgetData` and `MobileData` stopped after
-  about 5,000 bars; `DataServer::ProData` after about 10,000. The server then
-  extends the window back to an internal block boundary (in these runs the
-  start of a week for 1-minute bars, of a month for 15-minute bars and of a
-  year for 1-hour bars), which is why counts exceed 5,000 or 10,000.
-- At the cap, `series_completed` carries `{"data_completed": "limit"}` and
-  further `request_more_data` calls return no bars. At the start of a symbol's
+  server. `DataServer::Data`, `WidgetData` and `MobileData` returned about
+  5,000-8,000 bars and `DataServer::ProData` about 10,000-16,500. The cap
+  seems to be about 5,000 and 10,000 bars, extended back to an internal block
+  boundary (in these runs the start of a week for 1-minute bars, of a month
+  for 15-minute bars and of a year for 1-hour bars).
+- The page that reaches the cap still delivers its bars in
+  `timescale_update`, and its `series_completed` carries
+  `{"data_completed": "limit"}`; later `request_more_data` calls return no
+  bars. At the start of a symbol's
   history it carries `{"data_completed": "end"}` instead (BINANCE:BTCUSDT
   daily bars reached 2017-08-17 this way).
 - One `create_series` with a large bar count (30,000) returns the same bars as
@@ -76,8 +78,11 @@ BINANCE:BTCUSDT.
 ← series_completed  ["cs_x", "sds_1", "streaming", "s1", {"rt_update_period": 1}]
 ```
 
-At the cap the page has no `timescale_update` and the last element of
-`series_completed` is `{"data_completed": "limit", "rt_update_period": 1}`.
+The page that reaches the cap includes `timescale_update` with the remaining
+bars, and the last element of its `series_completed` is
+`{"data_completed": "limit", "rt_update_period": 1}`. A request after that gets
+only `series_loading` and the same `series_completed`, with no
+`timescale_update`.
 Real-time `du` updates for the newest bar can arrive between pages; the client
 keeps the latest value per timestamp.
 

@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, instrument, trace, warn};
+use url::Url;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -16,7 +17,7 @@ use crate::{
     },
     live::handler::{CommandTx, Handler, HandlerFactory},
     live::models::TradingViewDataEvent,
-    live::websocket::{ShutdownGuard, WebSocketClient},
+    live::websocket::{ErrorRecoveryConfig, ShutdownGuard, WebSocketClient},
     utils::symbol_init,
 };
 
@@ -29,6 +30,7 @@ const SERIES_ID: &str = "s1";
 pub struct HistoricalClient {
     pub(crate) auth_token: String,
     pub(crate) server: DataServer,
+    pub(crate) endpoint: Option<Url>,
 }
 
 impl HistoricalClient {
@@ -36,20 +38,48 @@ impl HistoricalClient {
         Self {
             auth_token: auth_token.into(),
             server,
+            endpoint: None,
         }
+    }
+
+    /// Connect to `endpoint` (a `ws://` or `wss://` URL) instead of
+    /// `wss://{server}.tradingview.com/socket.io/websocket`, for example a
+    /// proxy or a local test server. The auth token is sent to this endpoint.
+    pub fn with_endpoint(mut self, endpoint: &str) -> Result<Self> {
+        let url = Url::parse(endpoint)?;
+        if !matches!(url.scheme(), "ws" | "wss") {
+            return Err(Error::UrlParse(
+                format!(
+                    "endpoint must be a ws:// or wss:// URL, got {}",
+                    url.scheme()
+                )
+                .into(),
+            ));
+        }
+        self.endpoint = Some(url);
+        Ok(self)
     }
 
     /// Fetch historical bars for one symbol over a new WebSocket connection.
     ///
     /// Sends one `create_series` request and, when the request enables
     /// pagination, `request_more_data` pages until a stop condition holds; see
-    /// [`HistoricalRequest`]. The connection is closed before returning, also
-    /// when this future is dropped.
+    /// [`HistoricalRequest`]. Connecting (including the WebSocket handshake),
+    /// the initial load and each page are each bounded by `request.timeout`.
+    /// A closed connection is reported as [`Error::WebSocket`] as soon as it is
+    /// noticed. The connection is closed before returning, also when this
+    /// future is dropped.
     #[instrument(skip(self), fields(symbol, exchange))]
     pub async fn retrieve(&self, request: HistoricalRequest) -> Result<HistoricalResult> {
-        // Reject an incomplete request before opening a connection.
-        request.resolve_symbol_exchange()?;
-        let connection = HistoricalConnection::open(&self.auth_token, self.server).await?;
+        // Reject an invalid request before opening a connection.
+        request.validate()?;
+        let connection = HistoricalConnection::open(
+            &self.auth_token,
+            self.server,
+            self.endpoint.as_ref(),
+            request.timeout,
+        )
+        .await?;
         let result = connection.fetch(&request).await;
         // Cleanup problems must not discard data that was already retrieved.
         connection.close().await;
@@ -57,7 +87,10 @@ impl HistoricalClient {
     }
 
     pub(crate) async fn wait_for_completion(state: &Arc<Mutex<HistoricalState>>) {
-        wait_until(state, |state| state.completed || state.errored).await;
+        wait_until(state, |state| {
+            state.completed || state.errored || state.disconnected.is_some()
+        })
+        .await;
     }
 }
 
@@ -84,17 +117,35 @@ async fn wait_until(
     }
 }
 
-/// Return the recorded protocol error, if any.
+/// Return the recorded protocol error or, failing that, the connection loss.
+/// A TradingView protocol error keeps its type (`Error::TradingView`), so
+/// callers can tell an unknown symbol from a transport failure.
 fn take_error(state: &Mutex<HistoricalState>) -> Result<()> {
     let mut guard = state.lock().unwrap();
     if guard.errored {
+        if let Some(source) = guard.protocol_error {
+            return Err(Error::TradingView { source });
+        }
         let message = guard
             .error_message
             .take()
             .unwrap_or_else(|| "Historical data retrieval failed".to_string());
         return Err(Error::Internal(message.into()));
     }
+    if let Some(reason) = &guard.disconnected {
+        return Err(connection_closed(reason));
+    }
     Ok(())
+}
+
+fn connection_closed(reason: &str) -> Error {
+    Error::WebSocket(format!("connection closed: {reason}").into())
+}
+
+/// Whether `error` means the connection failed rather than the request: a
+/// fresh connection may succeed.
+pub(crate) fn is_connection_error(error: &Error) -> bool {
+    matches!(error, Error::WebSocket(_))
 }
 
 // =============================================================================
@@ -112,16 +163,41 @@ pub(crate) struct HistoricalConnection {
 }
 
 impl HistoricalConnection {
-    pub(crate) async fn open(auth_token: &str, server: DataServer) -> Result<Self> {
+    /// Connect and authenticate within `connect_timeout`. The connection never
+    /// reconnects by itself: a new connection would not have the chart
+    /// sessions, so a closed connection fails its fetches instead.
+    pub(crate) async fn open(
+        auth_token: &str,
+        server: DataServer,
+        endpoint: Option<&Url>,
+        connect_timeout: Duration,
+    ) -> Result<Self> {
         let router = SessionRouter::default();
         let ws = WebSocketClient::builder()
             .auth_token(auth_token)
             .server(server)
             .handler(router.clone())
+            .error_config(ErrorRecoveryConfig::one_shot(connect_timeout))
+            .maybe_endpoint(endpoint.cloned())
             .build()
-            .await?;
+            .await
+            .map_err(|error| match error {
+                Error::WebSocket(_) => error,
+                other => Error::WebSocket(format!("failed to connect: {other}").into()),
+            })?;
         let shutdown_guard = ws.shutdown_guard();
-        let reader = Arc::clone(&ws).spawn_reader_task_with_handle();
+        let reader = tokio::spawn({
+            let ws = Arc::clone(&ws);
+            let router = router.clone();
+            async move {
+                let reason = match ws.subscribe().await {
+                    Ok(()) => "the connection ended".to_string(),
+                    Err(error) => format!("the connection failed: {error}"),
+                };
+                debug!(%reason, "Historical connection reader stopped");
+                router.close_all(&reason);
+            }
+        });
         Ok(Self {
             ws,
             router,
@@ -131,7 +207,7 @@ impl HistoricalConnection {
     }
 
     pub(crate) fn is_closed(&self) -> bool {
-        self.ws.is_closed()
+        self.router.is_closed() || self.ws.is_closed()
     }
 
     pub(crate) async fn close(self) {
@@ -147,10 +223,23 @@ impl HistoricalConnection {
         drop(shutdown_guard);
     }
 
+    /// A send failure on a closed connection is a connection error.
+    fn send_error(&self, error: Error) -> Error {
+        if self.is_closed() && !is_connection_error(&error) {
+            connection_closed(&error.to_string())
+        } else {
+            error
+        }
+    }
+
     /// Fetch one symbol in a new chart session and delete the session after.
     pub(crate) async fn fetch(&self, request: &HistoricalRequest) -> Result<HistoricalResult> {
         let started = Instant::now();
+        request.validate()?;
         let (symbol, exchange) = request.resolve_symbol_exchange()?;
+        if self.is_closed() {
+            return Err(connection_closed("the connection was already closed"));
+        }
         debug!(symbol = %symbol, exchange = %exchange, "Historical retrieval started");
 
         let plan = request.pagination_plan();
@@ -176,7 +265,7 @@ impl HistoricalConnection {
             )
             .await;
 
-        if !self.ws.is_closed()
+        if !self.is_closed()
             && let Err(error) = self.ws.delete_chart_session(&chart_session).await
         {
             debug!(?error, "Failed to delete chart session");
@@ -185,12 +274,27 @@ impl HistoricalConnection {
         let outcome = outcome?;
 
         let mut guard = state.lock().unwrap();
-        let total_bars = guard.total_bars;
-        let data = trim_to_request(guard.finalize(), request.from_timestamp, request.max_bars);
         let symbol_info = guard
             .symbol_info
             .take()
             .ok_or_else(|| Error::Internal("No symbol info received".into()))?;
+        let total_bars = guard.total_bars;
+        let dropped_rows = guard.dropped_rows;
+        if dropped_rows > 0 {
+            warn!(
+                symbol = %symbol,
+                dropped_rows, "Dropped bar rows that could not be parsed"
+            );
+        }
+        let last_bar_close_time = guard.last_bar_close_time;
+        let mut data = guard.finalize();
+        let now = chrono::Utc::now().timestamp();
+        let mut last_bar_complete = last_bar_completeness(&data, last_bar_close_time, now);
+        if request.drop_incomplete_last_bar && last_bar_complete == Some(false) {
+            data.pop();
+            last_bar_complete = data.last().map(|_| true);
+        }
+        let data = trim_to_request(data, request.from_timestamp, request.max_bars);
         Ok(HistoricalResult {
             symbol_info,
             data,
@@ -200,6 +304,9 @@ impl HistoricalConnection {
             elapsed: started.elapsed(),
             pages_fetched: outcome.map_or(0, |outcome| outcome.pages),
             pagination_stop: outcome.map(|outcome| outcome.stop),
+            dropped_rows,
+            last_bar_close_time,
+            last_bar_complete,
         })
     }
 
@@ -222,7 +329,10 @@ impl HistoricalConnection {
         let instrument = format!("{exchange}:{symbol}");
         let symbol_series_id = format!("sds_sym_{}", crate::utils::gen_id());
 
-        self.ws.create_chart_session(chart_session).await?;
+        self.ws
+            .create_chart_session(chart_session)
+            .await
+            .map_err(|e| self.send_error(e))?;
         debug!(session = %chart_session, "Chart session created");
 
         let symbol_init_str = symbol_init()
@@ -240,7 +350,8 @@ impl HistoricalConnection {
                     Value::from(symbol_init_str),
                 ],
             )
-            .await?;
+            .await
+            .map_err(|e| self.send_error(e))?;
         debug!(instrument = %instrument, "Symbol resolution requested");
 
         // In count mode, exactly 6 arguments are sent (no range).
@@ -254,7 +365,10 @@ impl HistoricalConnection {
             initial_bars,
             request.range,
         );
-        self.ws.send("create_series", &create_series_args).await?;
+        self.ws
+            .send("create_series", &create_series_args)
+            .await
+            .map_err(|e| self.send_error(e))?;
         debug!(
             interval = ?request.interval,
             bars = initial_bars,
@@ -268,21 +382,40 @@ impl HistoricalConnection {
         )
         .await;
         if loaded.is_err() {
-            return Err(Error::Timeout("Historical data retrieval timed out".into()));
+            return Err(Error::Timeout(
+                format!(
+                    "initial series load did not complete within {:?}",
+                    request.timeout
+                )
+                .into(),
+            ));
         }
         take_error(state)?;
 
         let Some(plan) = plan else {
             return Ok(None);
         };
-        let ws = &self.ws;
         let outcome = paginate(state, plan, |count| async move {
-            ws.request_more_data(chart_session, SERIES_IDENTIFIER, count)
+            self.ws
+                .request_more_data(chart_session, SERIES_IDENTIFIER, count)
                 .await
+                .map_err(|e| self.send_error(e))
         })
         .await?;
         Ok(Some(outcome))
     }
+}
+
+/// Whether the last bar of `data` had closed at `now`, from the server's
+/// `lbs.bar_close_time`; `None` when there is no bar or no usable close time.
+fn last_bar_completeness(
+    data: &[DataPoint],
+    last_bar_close_time: Option<i64>,
+    now: i64,
+) -> Option<bool> {
+    let last_open = data.last()?.timestamp();
+    let close_time = last_bar_close_time.filter(|close| *close > last_open)?;
+    Some(now >= close_time)
 }
 
 /// Bars for the initial `create_series`: the requested `num_bars`, or with
@@ -334,7 +467,9 @@ pub(crate) struct PaginationOutcome {
 /// Must be called after the initial series completed. `request_more` sends
 /// one `request_more_data` for the given number of bars; the handler records
 /// the response in `state`. A page that does not complete within
-/// `plan.page_timeout` ends the walk with [`PaginationStop::Timeout`]; a
+/// `plan.page_timeout`, or a closed connection, is an error unless
+/// `plan.allow_partial` is set, in which case the walk ends with
+/// [`PaginationStop::Timeout`] or [`PaginationStop::ConnectionClosed`]. A
 /// protocol error or a failed send is returned as an error.
 pub(crate) async fn paginate<F, Fut>(
     state: &Arc<Mutex<HistoricalState>>,
@@ -348,14 +483,14 @@ where
     let mut pages = 0u32;
     let mut previous_earliest = None;
     loop {
-        let (bars, earliest, data_completed, completions) = {
+        let (bars, earliest, data_completed, disconnected) = {
             let mut guard = state.lock().unwrap();
             let (bars, earliest) = guard.bar_count_and_earliest();
             (
                 bars,
                 earliest,
                 guard.data_completed.clone(),
-                guard.completions,
+                guard.disconnected.clone(),
             )
         };
         if let Some(stop) = stop_reason(
@@ -369,34 +504,92 @@ where
             debug!(pages, bars, ?earliest, %stop, "Pagination stopped");
             return Ok(PaginationOutcome { pages, stop });
         }
+        if let Some(reason) = disconnected {
+            return closed_during_pagination(plan, pages, bars, &reason);
+        }
         previous_earliest = earliest;
 
         if !plan.page_delay.is_zero() {
             tokio::time::sleep(plan.page_delay).await;
         }
-        request_more(plan.page_size).await?;
+        // Snapshot right before the request, so a completion that arrives
+        // during the delay is not mistaken for this page's response.
+        let completions = state.lock().unwrap().completions;
+        if let Err(error) = request_more(plan.page_size).await {
+            let disconnected = state.lock().unwrap().disconnected.clone();
+            if let Some(reason) = disconnected {
+                return closed_during_pagination(plan, pages, bars, &reason);
+            }
+            return Err(error);
+        }
         pages += 1;
         trace!(page = pages, bars, ?earliest, "Requested more data");
 
         let page_done = tokio::time::timeout(
             plan.page_timeout,
             wait_until(state, |state| {
-                state.errored || state.completions > completions
+                state.errored || state.disconnected.is_some() || state.completions > completions
             }),
         )
         .await;
         if page_done.is_err() {
-            warn!(
-                page = pages,
-                bars, "Timed out waiting for a page; returning the bars received so far"
-            );
-            return Ok(PaginationOutcome {
-                pages,
-                stop: PaginationStop::Timeout,
-            });
+            if plan.allow_partial {
+                warn!(
+                    page = pages,
+                    bars, "Timed out waiting for a page; returning the bars received so far"
+                );
+                return Ok(PaginationOutcome {
+                    pages,
+                    stop: PaginationStop::Timeout,
+                });
+            }
+            return Err(Error::Timeout(
+                format!(
+                    "page {pages} did not complete within {:?} after {bars} bars; \
+                     set allow_partial to keep the bars received",
+                    plan.page_timeout
+                )
+                .into(),
+            ));
         }
-        take_error(state)?;
+        let (errored, completed, disconnected) = {
+            let guard = state.lock().unwrap();
+            (
+                guard.errored,
+                guard.completions > completions,
+                guard.disconnected.clone(),
+            )
+        };
+        if errored {
+            take_error(state)?;
+        }
+        if !completed && let Some(reason) = disconnected {
+            return closed_during_pagination(plan, pages, bars, &reason);
+        }
     }
+}
+
+/// The connection closed before pagination reached a stop condition.
+fn closed_during_pagination(
+    plan: &PaginationPlan,
+    pages: u32,
+    bars: usize,
+    reason: &str,
+) -> Result<PaginationOutcome> {
+    if plan.allow_partial {
+        warn!(
+            pages,
+            bars, reason, "Connection closed during pagination; returning the bars received so far"
+        );
+        return Ok(PaginationOutcome {
+            pages,
+            stop: PaginationStop::ConnectionClosed,
+        });
+    }
+    Err(connection_closed(&format!(
+        "{reason} (during pagination, after {pages} pages and {bars} bars; \
+         set allow_partial to keep the bars received)"
+    )))
 }
 
 /// First stop condition that holds after `pages` pages, if any.
@@ -500,6 +693,13 @@ fn series_completed_flag(message: &[Value]) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Parse one bar row; `None` for a malformed row or one without OHLC values.
+fn parse_bar_row(row: &Value) -> Option<DataPoint> {
+    let point = DataPoint::deserialize(row).ok()?;
+    let usable = point.value.len() >= 5 && point.value[..5].iter().all(|v| v.is_finite());
+    usable.then_some(point)
+}
+
 /// Apply one chart event to the state of the chart session it belongs to.
 fn apply_event(state: &Mutex<HistoricalState>, event: TradingViewDataEvent, message: &[Value]) {
     match event {
@@ -520,14 +720,29 @@ fn apply_event(state: &Mutex<HistoricalState>, event: TradingViewDataEvent, mess
                 return;
             };
             for series_val in obj.values() {
-                if let Some(s_arr) = series_val.get("s").and_then(|v| v.as_array()) {
-                    let points: Vec<DataPoint> = s_arr
-                        .iter()
-                        .filter_map(|v| DataPoint::deserialize(v).ok())
-                        .collect();
-                    if !points.is_empty() {
-                        state.lock().unwrap().record_points(points, s_arr.len());
-                    }
+                let close_time = series_val
+                    .get("lbs")
+                    .and_then(|lbs| lbs.get("bar_close_time"))
+                    .and_then(Value::as_f64)
+                    .filter(|t| t.is_finite())
+                    .map(|t| t as i64);
+                let Some(s_arr) = series_val.get("s").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                let points: Vec<DataPoint> = s_arr.iter().filter_map(parse_bar_row).collect();
+                let dropped = s_arr.len() - points.len();
+                let mut state = state.lock().unwrap();
+                if let Some(close_time) = close_time {
+                    state.record_last_bar_close_time(close_time);
+                }
+                if dropped > 0 {
+                    warn!(dropped, "Dropping bar rows that could not be parsed");
+                    state.record_dropped_rows(dropped);
+                }
+                if !points.is_empty() {
+                    state.record_points(points, s_arr.len());
+                } else if !s_arr.is_empty() {
+                    state.total_bars += s_arr.len();
                 }
             }
         }
@@ -541,7 +756,7 @@ fn apply_event(state: &Mutex<HistoricalState>, event: TradingViewDataEvent, mess
             state
                 .lock()
                 .unwrap()
-                .fail(format!("TradingView error: {tv_error:?}"));
+                .fail_with(tv_error, format!("TradingView error: {tv_error:?}"));
         }
         _ => {}
     }
@@ -560,42 +775,78 @@ fn record_transport_error(state: &Mutex<HistoricalState>, error: &Error) {
 
 /// Handler that routes chart events to the state of their chart session, so
 /// one connection can serve several fetches in turn. Events of unknown or
-/// already deleted chart sessions are ignored.
+/// already deleted chart sessions are ignored. Once the connection closes,
+/// every registered fetch, and every fetch registered later, is told so.
 #[derive(Clone, Default)]
 pub(crate) struct SessionRouter {
-    sessions: Arc<Mutex<HashMap<String, Arc<Mutex<HistoricalState>>>>>,
+    inner: Arc<Mutex<RouterInner>>,
+}
+
+#[derive(Default)]
+struct RouterInner {
+    sessions: HashMap<String, Arc<Mutex<HistoricalState>>>,
+    closed: Option<String>,
 }
 
 impl SessionRouter {
     fn register(&self, chart_session: &str, state: Arc<Mutex<HistoricalState>>) {
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(chart_session.to_string(), state);
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(reason) = &inner.closed {
+            state.lock().unwrap().disconnect(reason);
+        }
+        inner.sessions.insert(chart_session.to_string(), state);
     }
 
     fn unregister(&self, chart_session: &str) {
-        self.sessions.lock().unwrap().remove(chart_session);
+        self.inner.lock().unwrap().sessions.remove(chart_session);
     }
 
     fn all(&self) -> Vec<Arc<Mutex<HistoricalState>>> {
-        self.sessions.lock().unwrap().values().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn get(&self, chart_session: &str) -> Option<Arc<Mutex<HistoricalState>>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .sessions
+            .get(chart_session)
+            .cloned()
+    }
+
+    /// Mark the connection closed and wake every waiting fetch.
+    fn close_all(&self, reason: &str) {
+        let states = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.closed.get_or_insert_with(|| reason.to_string());
+            inner.sessions.values().cloned().collect::<Vec<_>>()
+        };
+        for state in states {
+            state.lock().unwrap().disconnect(reason);
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.inner.lock().unwrap().closed.is_some()
     }
 }
 
 impl Handler for SessionRouter {
     fn handle_events(&self, event: TradingViewDataEvent, message: &[Value]) {
         match message.first().and_then(Value::as_str) {
-            Some(session) if session.starts_with("cs_") => {
-                let state = self.sessions.lock().unwrap().get(session).cloned();
-                match state {
-                    Some(state) => apply_event(&state, event, message),
-                    None => trace!(
-                        ?event,
-                        session, "Ignoring event of an unknown chart session"
-                    ),
-                }
-            }
+            Some(session) if session.starts_with("cs_") => match self.get(session) {
+                Some(state) => apply_event(&state, event, message),
+                None => trace!(
+                    ?event,
+                    session, "Ignoring event of an unknown chart session"
+                ),
+            },
             // Errors such as `protocol_error` do not name a chart session.
             _ if matches!(event, TradingViewDataEvent::OnError(_)) => {
                 for state in self.all() {
@@ -728,6 +979,7 @@ mod tests {
             page_size: 50,
             page_delay: Duration::ZERO,
             page_timeout: Duration::from_secs(2),
+            allow_partial: false,
         }
     }
 
@@ -1010,7 +1262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_paginate_timeout_keeps_received_bars() {
+    async fn test_paginate_timeout_is_an_error_by_default() {
         // The server never answers the second page.
         let server = ScriptedServer::new(
             &[bars(1_000..1_010), completed(None)],
@@ -1018,6 +1270,25 @@ mod tests {
         );
         let plan = PaginationPlan {
             page_timeout: Duration::from_millis(50),
+            ..plan()
+        };
+
+        let error = server.paginate(&plan).await.unwrap_err();
+
+        assert!(matches!(error, Error::Timeout(_)), "{error}");
+        assert!(error.to_string().contains("allow_partial"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn test_paginate_timeout_keeps_received_bars_with_allow_partial() {
+        // The server never answers the second page.
+        let server = ScriptedServer::new(
+            &[bars(1_000..1_010), completed(None)],
+            vec![vec![bars(990..1_000), completed(None)], vec![]],
+        );
+        let plan = PaginationPlan {
+            page_timeout: Duration::from_millis(50),
+            allow_partial: true,
             ..plan()
         };
 
@@ -1033,6 +1304,191 @@ mod tests {
         );
         assert!(started.elapsed() >= Duration::from_millis(50));
         assert_eq!(server.timestamps(), (990..1_010).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn test_paginate_connection_close_is_an_error_by_default() {
+        let server = ScriptedServer::new(&[bars(1_000..1_010), completed(None)], vec![vec![]]);
+        let state = Arc::clone(&server.state);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            state.lock().unwrap().disconnect("server went away");
+        });
+        let started = Instant::now();
+
+        let error = server.paginate(&plan()).await.unwrap_err();
+
+        assert!(is_connection_error(&error), "{error}");
+        assert!(error.to_string().contains("server went away"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a closed connection must not wait for the page timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_paginate_connection_close_keeps_bars_with_allow_partial() {
+        let server = ScriptedServer::new(
+            &[bars(1_000..1_010), completed(None)],
+            vec![vec![bars(990..1_000), completed(None)], vec![]],
+        );
+        let state = Arc::clone(&server.state);
+        let plan = PaginationPlan {
+            allow_partial: true,
+            page_delay: Duration::from_millis(30),
+            ..plan()
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(45)).await;
+            state.lock().unwrap().disconnect("server went away");
+        });
+
+        let outcome = server.paginate(&plan).await.unwrap();
+
+        assert_eq!(outcome.stop, PaginationStop::ConnectionClosed);
+        assert_eq!(outcome.pages, 2);
+        assert_eq!(server.timestamps(), (990..1_010).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn test_paginate_stops_cleanly_when_target_met_before_close() {
+        // The page that reaches max_bars arrives, then the connection closes.
+        let state = Arc::new(Mutex::new(HistoricalState::new()));
+        let handler = handler_for(&state);
+        feed(&handler, &bars(1_000..1_010));
+        feed(&handler, &completed(None));
+        let plan = PaginationPlan {
+            max_bars: Some(20),
+            ..plan()
+        };
+
+        let outcome = paginate(&state, &plan, |_| {
+            feed(&handler, &bars(990..1_000));
+            feed(&handler, &completed(None));
+            state
+                .lock()
+                .unwrap()
+                .disconnect("closed right after the page");
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.stop, PaginationStop::ReachedMaxBars);
+        assert_eq!(outcome.pages, 1);
+    }
+
+    #[tokio::test]
+    async fn test_paginate_ignores_completion_during_page_delay() {
+        // A stray series_completed (no data) arrives while waiting page_delay;
+        // the page itself is never answered. With the snapshot taken before
+        // the delay this stray completion was mistaken for the page.
+        let server = ScriptedServer::new(&[bars(1_000..1_010), completed(None)], vec![vec![]]);
+        let handler = server.handler.clone();
+        let plan = PaginationPlan {
+            page_delay: Duration::from_millis(60),
+            page_timeout: Duration::from_millis(80),
+            allow_partial: true,
+            ..plan()
+        };
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            feed(&handler, &completed(None));
+        });
+
+        let outcome = server.paginate(&plan).await.unwrap();
+
+        assert_eq!(outcome.stop, PaginationStop::Timeout);
+        assert_eq!(outcome.pages, 1);
+    }
+
+    #[test]
+    fn test_unparseable_rows_are_counted_and_dropped() {
+        let state = Arc::new(Mutex::new(HistoricalState::new()));
+        let handler = handler_for(&state);
+        let message = json!({
+            "m": "timescale_update",
+            "p": [CS, {"sds_1": {
+                "lbs": {"bar_close_time": 1_003_600},
+                "s": [
+                    {"i": 0, "v": [1_000_000.0, 1.0, 2.0, 0.5, 1.5, 10.0]},
+                    {"i": 1, "v": "garbage"},
+                    {"i": 2, "v": [1_003_600.0, 1.0]},
+                    {"i": 3, "v": [1_007_200.0, 1.0, 2.0, null, 1.5]},
+                ]
+            }}, {}]
+        });
+        feed(&handler, &message);
+        let guard = state.lock().unwrap();
+        assert_eq!(guard.data.len(), 1);
+        assert_eq!(guard.dropped_rows, 3);
+        assert_eq!(guard.total_bars, 4);
+        assert_eq!(guard.last_bar_close_time, Some(1_003_600));
+    }
+
+    #[test]
+    fn test_last_bar_completeness() {
+        let data: Vec<DataPoint> = [1_000, 4_600]
+            .into_iter()
+            .map(|ts| DataPoint {
+                index: 0,
+                value: vec![ts as f64, 1.0, 1.0, 1.0, 1.0, 1.0],
+            })
+            .collect();
+        // The newest bar opened at 4_600 and closes at 8_200.
+        assert_eq!(
+            last_bar_completeness(&data, Some(8_200), 8_199),
+            Some(false)
+        );
+        assert_eq!(last_bar_completeness(&data, Some(8_200), 8_200), Some(true));
+        assert_eq!(last_bar_completeness(&data, None, 9_000), None);
+        // A close time that is not after the newest bar's open is unusable.
+        assert_eq!(last_bar_completeness(&data, Some(4_600), 9_000), None);
+        assert_eq!(last_bar_completeness(&[], Some(8_200), 9_000), None);
+    }
+
+    #[test]
+    fn test_is_complete_by_stop_reason() {
+        for (stop, complete) in [
+            (PaginationStop::ReachedFrom, true),
+            (PaginationStop::ReachedMaxBars, true),
+            (PaginationStop::EndOfHistory, true),
+            (PaginationStop::BarLimit, false),
+            (PaginationStop::MaxPages, false),
+            (PaginationStop::NoMoreData, false),
+            (PaginationStop::Timeout, false),
+            (PaginationStop::ConnectionClosed, false),
+        ] {
+            assert_eq!(stop.is_complete(), complete, "{stop}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_session_router_close_wakes_waiters_and_fails_later_sessions() {
+        let router = SessionRouter::default();
+        let active = Arc::new(Mutex::new(HistoricalState::new()));
+        router.register("cs_active", Arc::clone(&active));
+        let waiter = {
+            let active = Arc::clone(&active);
+            tokio::spawn(async move { HistoricalClient::wait_for_completion(&active).await })
+        };
+        tokio::task::yield_now().await;
+
+        router.close_all("server closed");
+
+        tokio::time::timeout(Duration::from_millis(100), waiter)
+            .await
+            .expect("closing the connection must wake waiters")
+            .unwrap();
+        assert!(router.is_closed());
+        assert!(matches!(take_error(&active), Err(Error::WebSocket(_))));
+
+        let late = Arc::new(Mutex::new(HistoricalState::new()));
+        router.register("cs_late", Arc::clone(&late));
+        assert_eq!(
+            late.lock().unwrap().disconnected.as_deref(),
+            Some("server closed")
+        );
     }
 
     #[tokio::test]
@@ -1067,7 +1523,46 @@ mod tests {
 
         let error = server.paginate(&plan()).await.unwrap_err();
 
-        assert!(error.to_string().contains("SeriesError"), "{error}");
+        assert!(
+            matches!(
+                error,
+                Error::TradingView {
+                    source: TradingViewError::SeriesError
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_first_protocol_error_wins_and_keeps_its_type() {
+        // An unknown symbol: symbol_error, then series_error for the series.
+        let state = Arc::new(Mutex::new(HistoricalState::new()));
+        let handler = handler_for(&state);
+        feed(
+            &handler,
+            &json!({"m": "symbol_error", "p": [CS, "sds_sym_1", "invalid symbol"]}),
+        );
+        feed(
+            &handler,
+            &json!({"m": "series_error", "p": [CS, "sds_1", "s1", "resolve error"]}),
+        );
+
+        let error = take_error(&state).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                Error::TradingView {
+                    source: TradingViewError::SymbolError
+                }
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            state.lock().unwrap().error_message.as_deref(),
+            Some("TradingView error: SymbolError")
+        );
     }
 
     #[tokio::test]

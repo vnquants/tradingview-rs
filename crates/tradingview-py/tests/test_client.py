@@ -25,6 +25,7 @@ def test_client_init_anonymous() -> None:
     assert client.is_authenticated is False
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_client_login_invalid_credentials() -> None:
     with pytest.raises(AuthenticationError):
@@ -34,6 +35,7 @@ async def test_client_login_invalid_credentials() -> None:
         )
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_client_authenticate_instance() -> None:
     client = TradingViewClient()
@@ -46,6 +48,7 @@ async def test_client_authenticate_instance() -> None:
     await client.close()
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_client_login_with_blank_captcha_key_rejected() -> None:
     with pytest.raises(ConnectionError, match="2Captcha API key cannot be empty"):
@@ -56,6 +59,7 @@ async def test_client_login_with_blank_captcha_key_rejected() -> None:
         )
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_client_authenticate_with_blank_captcha_key_rejected() -> None:
     client = TradingViewClient()
@@ -145,6 +149,7 @@ def test_client_init_invalid_server_type() -> None:
         client_cls(server="prodata")
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_client_authenticate_retains_server() -> None:
     client = TradingViewClient(server=DataServer.ProData)

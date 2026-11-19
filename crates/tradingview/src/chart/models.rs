@@ -334,77 +334,111 @@ impl From<SymbolInfo> for Ticker {
     }
 }
 
+/// Symbol metadata from TradingView's `symbol_resolved` message.
+///
+/// Every field is parsed leniently: a missing, `null` or wrongly typed value
+/// takes the field's default instead of failing the whole payload.
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug, Default)]
 #[serde(default)]
 pub struct SymbolInfo {
     #[serde(rename(deserialize = "pro_name"))]
+    #[serde(deserialize_with = "lenient::ustr")]
     pub id: Ustr,
 
     #[serde(rename(deserialize = "original_name"))]
+    #[serde(deserialize_with = "lenient::ustr")]
     pub original_name: Ustr,
 
+    #[serde(deserialize_with = "lenient::ustr")]
     pub name: Ustr,
+    #[serde(deserialize_with = "lenient::ustr")]
     pub exchange: Ustr,
+    #[serde(deserialize_with = "lenient::ustr")]
     pub description: Ustr,
 
     #[serde(rename = "business_description")]
+    #[serde(deserialize_with = "lenient::ustr")]
     pub business_description: Ustr,
 
     #[serde(rename = "listed_exchange")]
+    #[serde(deserialize_with = "lenient::ustr")]
     pub listed_exchange: Ustr,
 
     #[serde(rename = "provider_id")]
+    #[serde(deserialize_with = "lenient::ustr")]
     pub provider_id: Ustr,
 
     #[serde(rename = "base_currency")]
+    #[serde(deserialize_with = "lenient::ustr")]
     pub base_currency: Ustr,
 
     #[serde(rename = "base_currency_id")]
+    #[serde(deserialize_with = "lenient::ustr")]
     pub base_currency_id: Ustr,
 
     #[serde(rename = "total_revenue")]
+    #[serde(deserialize_with = "lenient::f64")]
     pub total_revenue: f64,
 
     #[serde(rename = "price_earnings_ttm")]
+    #[serde(deserialize_with = "lenient::f64")]
     pub price_earnings_ttm: f64,
 
     #[serde(rename = "currency_id")]
+    #[serde(deserialize_with = "lenient::ustr")]
     pub currency_id: Ustr,
 
     #[serde(rename = "currency_code")]
+    #[serde(deserialize_with = "lenient::ustr")]
     pub currency_code: Ustr,
 
+    #[serde(deserialize_with = "lenient::ustr")]
     pub session_holidays: Ustr,
 
+    #[serde(deserialize_with = "lenient::vec")]
     pub subsessions: Vec<Subsession>,
 
+    #[serde(deserialize_with = "lenient::ustr")]
     pub timezone: Ustr,
 
     #[serde(rename(deserialize = "type"))]
+    #[serde(deserialize_with = "lenient::ustr")]
     pub market_type: Ustr,
 
+    #[serde(deserialize_with = "lenient::vec")]
     pub typespecs: Vec<Ustr>,
 
+    #[serde(deserialize_with = "lenient::vec")]
     pub aliases: Vec<Ustr>,
 
+    #[serde(deserialize_with = "lenient::f64")]
     pub total_shares_outstanding_calculated: f64,
 
+    #[serde(deserialize_with = "lenient::f64")]
     pub market_cap_basic: f64,
 
+    #[serde(deserialize_with = "lenient::i64")]
     pub earnings_release_date: i64,
 
+    #[serde(deserialize_with = "lenient::vec")]
     pub base_name: Vec<Ustr>,
 
+    #[serde(deserialize_with = "lenient::ustr")]
     pub sector: Ustr,
 
+    #[serde(deserialize_with = "lenient::ustr")]
     pub current_session: Ustr,
 
+    #[serde(deserialize_with = "lenient::u16")]
     pub founded: u16,
 
+    #[serde(deserialize_with = "lenient::f64")]
     pub last_annual_eps: f64,
 
+    #[serde(deserialize_with = "lenient::bool")]
     pub fractional: bool,
 
+    #[serde(deserialize_with = "lenient::ustr")]
     pub industry: Ustr,
 
     /// Trading session in exchange time, e.g. `0900-1500` or `24x7`.
@@ -462,15 +496,20 @@ impl SymbolInfo {
 
     /// Tick size that applies at `price`.
     ///
-    /// Uses [`variable_tick_size`] when it is set and well formed (tick,
-    /// upper bound, tick, upper bound, ..., tick, where a bound is exclusive)
-    /// and falls back to [`Self::tick_size`] otherwise.
+    /// Uses [`variable_tick_size`] when it is set (tick, upper bound, tick,
+    /// upper bound, ..., tick, where a bound is exclusive) and
+    /// [`Self::tick_size`] when it is empty. Returns `None` for a non-finite
+    /// price or a `variable_tick_size` that cannot be parsed.
     ///
     /// [`variable_tick_size`]: SymbolInfo::variable_tick_size
     pub fn tick_size_at(&self, price: f64) -> Option<f64> {
-        let Some(levels) = parse_variable_tick_size(&self.variable_tick_size) else {
+        if !price.is_finite() {
+            return None;
+        }
+        if self.variable_tick_size.trim().is_empty() {
             return self.tick_size();
-        };
+        }
+        let levels = parse_variable_tick_size(&self.variable_tick_size)?;
         levels.chunks(2).find_map(|level| match *level {
             [tick, upper_bound] => (price < upper_bound).then_some(tick),
             [tick] => Some(tick),
@@ -511,19 +550,42 @@ mod lenient {
     use serde_json::Value;
     use ustr::Ustr;
 
+    /// An integral value in `[min, max]`, from a JSON number or numeric
+    /// string; `None` for fractions, out-of-range or non-numeric values.
+    fn integral(value: &Value, min: f64, max: f64) -> Option<f64> {
+        let number = match value {
+            Value::Number(n) => n.as_f64()?,
+            Value::String(s) => s.trim().parse::<f64>().ok()?,
+            _ => return None,
+        };
+        (number.is_finite() && number.fract() == 0.0 && number >= min && number <= max)
+            .then_some(number)
+    }
+
+    /// Unsigned integer; fractional, negative or out-of-range values become 0.
     pub(super) fn u64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
-        Ok(match Value::deserialize(deserializer)? {
-            Value::Number(n) => n
-                .as_u64()
-                .or_else(|| {
-                    n.as_f64()
-                        .filter(|v| v.is_finite() && *v >= 0.0)
-                        .map(|v| v.round() as u64)
-                })
-                .unwrap_or_default(),
-            Value::String(s) => s.trim().parse().unwrap_or_default(),
-            _ => 0,
-        })
+        let value = Value::deserialize(deserializer)?;
+        if let Some(exact) = value.as_u64() {
+            return Ok(exact);
+        }
+        // 2^53: larger f64 values are not exact integers.
+        Ok(integral(&value, 0.0, 9_007_199_254_740_992.0).map_or(0, |v| v as u64))
+    }
+
+    pub(super) fn i64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        if let Some(exact) = value.as_i64() {
+            return Ok(exact);
+        }
+        Ok(
+            integral(&value, -9_007_199_254_740_992.0, 9_007_199_254_740_992.0)
+                .map_or(0, |v| v as i64),
+        )
+    }
+
+    pub(super) fn u16<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u16, D::Error> {
+        let value = Value::deserialize(deserializer)?;
+        Ok(integral(&value, 0.0, f64::from(u16::MAX)).map_or(0, |v| v as u16))
     }
 
     pub(super) fn f64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f64, D::Error> {
@@ -531,6 +593,30 @@ mod lenient {
             Value::Number(n) => n.as_f64().unwrap_or_default(),
             Value::String(s) => s.trim().parse().unwrap_or_default(),
             _ => 0.0,
+        })
+    }
+
+    pub(super) fn bool<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+        Ok(match Value::deserialize(deserializer)? {
+            Value::Bool(b) => b,
+            Value::String(s) => s.trim().eq_ignore_ascii_case("true"),
+            _ => false,
+        })
+    }
+
+    /// A list whose unreadable elements are skipped; anything but an array
+    /// becomes an empty list.
+    pub(super) fn vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+    where
+        D: Deserializer<'de>,
+        T: serde::de::DeserializeOwned,
+    {
+        Ok(match Value::deserialize(deserializer)? {
+            Value::Array(items) => items
+                .into_iter()
+                .filter_map(|item| serde_json::from_value(item).ok())
+                .collect(),
+            _ => Vec::new(),
         })
     }
 
@@ -922,7 +1008,10 @@ mod tests {
             variable_tick_size: Ustr::from("10 abc 50"),
             ..Default::default()
         };
-        assert_eq!(malformed.tick_size_at(5.0), Some(0.25));
+        assert_eq!(malformed.tick_size(), Some(0.25));
+        assert_eq!(malformed.tick_size_at(5.0), None, "no silent fallback");
+        assert_eq!(crypto.tick_size_at(f64::NAN), None);
+        assert_eq!(crypto.tick_size_at(f64::INFINITY), None);
 
         let missing = SymbolInfo::default();
         assert_eq!(missing.tick_size(), None);
@@ -948,6 +1037,51 @@ mod tests {
         assert_eq!(info.isin, "");
         assert_eq!(info.session, "24");
         assert_eq!(info.tick_size(), Some(0.01));
+    }
+
+    #[test]
+    fn test_symbol_info_rejects_fractional_and_out_of_range_scales() {
+        for (pricescale, minmov) in [
+            (Value::from(2.5), Value::from(1)),
+            (Value::from(1e30), Value::from(1)),
+            (Value::from(100), Value::from("0.5")),
+            (Value::from(-100), Value::from(1)),
+        ] {
+            let mut value = fixture_symbol_info_value();
+            value["pricescale"] = pricescale.clone();
+            value["minmov"] = minmov.clone();
+            let info = SymbolInfo::deserialize(&value).unwrap();
+            assert_eq!(
+                info.tick_size(),
+                None,
+                "pricescale={pricescale} minmov={minmov} must not yield a tick size"
+            );
+        }
+        let mut value = fixture_symbol_info_value();
+        value["pricescale"] = Value::from("1e2");
+        assert_eq!(SymbolInfo::deserialize(&value).unwrap().pricescale, 100);
+    }
+
+    #[test]
+    fn test_symbol_info_tolerates_null_and_odd_legacy_fields() {
+        let mut value = fixture_symbol_info_value();
+        value["founded"] = Value::Null;
+        value["typespecs"] = Value::Null;
+        value["fractional"] = Value::Null;
+        value["earnings_release_date"] = Value::from("soon");
+        value["subsessions"] = serde_json::json!([{"id": "regular", "private": null}, 7]);
+        value["base_name"] = serde_json::json!(["HOSE:VCB", null, 3]);
+        value["description"] = Value::Null;
+        let info = SymbolInfo::deserialize(&value).expect("one odd field must not fail the fetch");
+        assert_eq!(info.founded, 0);
+        assert!(info.typespecs.is_empty());
+        assert!(!info.fractional);
+        assert_eq!(info.earnings_release_date, 0);
+        assert!(info.subsessions.is_empty());
+        assert_eq!(info.base_name, vec![Ustr::from("HOSE:VCB")]);
+        assert_eq!(info.description, "");
+        assert_eq!(info.pricescale, 1);
+        assert_eq!(info.id, "HOSE:VCB");
     }
 
     #[test]

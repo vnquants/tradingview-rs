@@ -1,6 +1,7 @@
 pub mod callbacks;
 pub mod client;
 pub mod errors;
+pub mod historical;
 pub mod models;
 pub mod session;
 pub mod streaming;

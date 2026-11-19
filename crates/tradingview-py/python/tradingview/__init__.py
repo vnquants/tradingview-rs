@@ -1,5 +1,21 @@
 """TradingView Data Provider Python API backed by tradingview-rs."""
 
+from typing import Literal
+
+from tradingview._batch import HistoricalBatch
+
+PaginationStop = Literal[
+    "reached_from",
+    "reached_max_bars",
+    "max_pages",
+    "end_of_history",
+    "bar_limit",
+    "no_more_data",
+    "timeout",
+    "connection_closed",
+]
+"""Why pagination stopped walking back (`HistoricalSeries.pagination_stop`)."""
+
 # Import native extension
 try:
     from tradingview import _tradingview as _tv
@@ -18,6 +34,7 @@ if _tv is not None:
         "TimeoutError",
         "RateLimitError",
         "ProtocolError",
+        "IncompleteHistoryError",
         "Interval",
         "FinancialPeriod",
         "EconomicImportance",
@@ -52,9 +69,12 @@ __all__ = [
     "FinancialPeriod",
     "FundamentalPoint",
     "FundamentalSeries",
+    "HistoricalBatch",
     "HistoricalSeries",
+    "IncompleteHistoryError",
     "Interval",
     "MarketAdjustment",
+    "PaginationStop",
     "ProtocolError",
     "QuoteSubscription",
     "QuoteTick",

@@ -3,13 +3,10 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyType};
 use pyo3_async_runtimes::tokio::future_into_py;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::debug;
-use tradingview::Currency;
-use tradingview::chart::OHLCV;
-use tradingview::historical::{BatchConfig, HistoricalClient, HistoricalRequest, HistoricalResult};
+use tradingview::historical::{BatchConfig, HistoricalClient};
 use tradingview::live::models::DataServer as CoreDataServer;
 use tradingview::live::websocket::WebSocketClient;
 use tradingview::models::UserCookies;
@@ -17,7 +14,7 @@ use tradingview::models::UserCookies;
 use crate::PyObject;
 use crate::callbacks::CallbackDispatcher;
 use crate::errors::{AuthenticationError, to_py_err};
-use crate::models::bar::{Bar, HistoricalSeries};
+use crate::historical::{HistoryOptions, batch_to_python, require_complete, series_from_result};
 use crate::models::calendar::EconomicEvent;
 use crate::models::candle::{BarSubscription, CandleUpdate};
 use crate::models::enums::{
@@ -25,7 +22,6 @@ use crate::models::enums::{
 };
 use crate::models::fundamental::{FundamentalPoint, FundamentalSeries};
 use crate::models::quote::{QuoteSubscription, QuoteTick};
-use crate::models::symbol::SymbolInfo;
 use crate::session::{CookieImportError, export_user_cookies, parse_user_cookies};
 use crate::streaming::{CandleStreamHandler, QuoteStreamHandler};
 
@@ -34,119 +30,6 @@ use crate::streaming::{CandleStreamHandler, QuoteStreamHandler};
 // equal to the core defaults.
 const _: () = assert!(tradingview::historical::DEFAULT_PAGE_SIZE == 5000);
 const _: () = assert!(tradingview::historical::DEFAULT_PAGE_DELAY.as_millis() == 500);
-
-/// Validated pagination, adjustment, session and currency keywords shared by
-/// the historical methods.
-#[derive(Debug, Clone)]
-struct HistoryOptions {
-    from_timestamp: Option<i64>,
-    max_bars: Option<u64>,
-    max_pages: Option<u32>,
-    page_size: u64,
-    page_delay: Duration,
-    adjustment: Option<MarketAdjustment>,
-    session_type: Option<SessionType>,
-    currency: Option<Currency>,
-}
-
-impl HistoryOptions {
-    #[allow(clippy::too_many_arguments)]
-    fn parse(
-        from_timestamp: Option<i64>,
-        max_bars: Option<u64>,
-        max_pages: Option<u32>,
-        page_size: u64,
-        page_delay: f64,
-        adjustment: Option<MarketAdjustment>,
-        session_type: Option<SessionType>,
-        currency: Option<String>,
-    ) -> PyResult<Self> {
-        if page_size == 0 {
-            return Err(PyValueError::new_err(
-                "page_size must be a positive number of bars",
-            ));
-        }
-        if max_bars == Some(0) {
-            return Err(PyValueError::new_err(
-                "max_bars must be a positive number of bars",
-            ));
-        }
-        let page_delay = Duration::try_from_secs_f64(page_delay).map_err(|_| {
-            PyValueError::new_err("page_delay must be a finite, non-negative number of seconds")
-        })?;
-        let currency = currency
-            .map(|code| {
-                Currency::from_code(&code.trim().to_ascii_uppercase()).ok_or_else(|| {
-                    PyValueError::new_err(format!(
-                        "currency must be an ISO 4217 code such as 'USD', got {code:?}"
-                    ))
-                })
-            })
-            .transpose()?;
-        Ok(Self {
-            from_timestamp,
-            max_bars,
-            max_pages,
-            page_size,
-            page_delay,
-            adjustment,
-            session_type,
-            currency,
-        })
-    }
-
-    /// Request template without a symbol (see `HistoricalRequest::for_symbol`).
-    fn request(
-        &self,
-        interval: Interval,
-        n_bars: Option<u64>,
-        with_replay: bool,
-    ) -> HistoricalRequest {
-        HistoricalRequest::builder()
-            .interval(interval.into())
-            .maybe_num_bars(n_bars)
-            .with_replay(with_replay)
-            .maybe_from_timestamp(self.from_timestamp)
-            .maybe_max_bars(self.max_bars)
-            .maybe_max_pages(self.max_pages)
-            .page_size(self.page_size)
-            .page_delay(self.page_delay)
-            .maybe_adjustment(self.adjustment.map(Into::into))
-            .maybe_session_type(self.session_type.map(Into::into))
-            .maybe_currency(self.currency)
-            .build()
-    }
-}
-
-/// Convert a core result into the Python series.
-fn series_from_result(
-    symbol: String,
-    exchange: String,
-    interval: Interval,
-    result: HistoricalResult,
-) -> HistoricalSeries {
-    let bars = result
-        .data
-        .iter()
-        .map(|dp| Bar {
-            timestamp: dp.timestamp(),
-            open: dp.open(),
-            high: dp.high(),
-            low: dp.low(),
-            close: dp.close(),
-            volume: dp.volume(),
-        })
-        .collect();
-    HistoricalSeries {
-        symbol,
-        exchange,
-        interval,
-        bars,
-        symbol_info: Some(SymbolInfo::from(&result.symbol_info)),
-        pages_fetched: result.pages_fetched,
-        pagination_stop: result.pagination_stop.map(|stop| stop.as_str().to_string()),
-    }
-}
 
 /// Main client interface for accessing TradingView market data.
 #[pyclass(from_py_object)]
@@ -357,9 +240,11 @@ impl TradingViewClient {
 
     /// Retrieve historical OHLCV candlestick bars for a single symbol asynchronously.
     ///
-    /// If `as_dataframe=True`, returns a Polars DataFrame directly. Setting
-    /// `from_timestamp`, `max_bars` or `max_pages` pages back with
-    /// `request_more_data`; see `HistoricalRequest` in the Rust crate.
+    /// If `as_dataframe=True`, returns a Polars DataFrame directly; an incomplete
+    /// paginated history then raises `IncompleteHistoryError` unless
+    /// `allow_partial=True`. Setting `from_timestamp`, `max_bars` or `max_pages`
+    /// pages back with `request_more_data`. Keywords are validated when the method
+    /// is called, before the coroutine is returned.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         symbol,
@@ -378,6 +263,8 @@ impl TradingViewClient {
         adjustment = None,
         session_type = None,
         currency = None,
+        allow_partial = false,
+        drop_incomplete_last_bar = false,
     ))]
     pub fn get_historical<'py>(
         &self,
@@ -385,20 +272,23 @@ impl TradingViewClient {
         symbol: String,
         exchange: String,
         interval: Interval,
-        n_bars: Option<u64>,
+        n_bars: Option<i64>,
         with_replay: bool,
         as_dataframe: bool,
         server: Option<DataServer>,
         from_timestamp: Option<i64>,
-        max_bars: Option<u64>,
-        max_pages: Option<u32>,
-        page_size: u64,
+        max_bars: Option<i64>,
+        max_pages: Option<i64>,
+        page_size: i64,
         page_delay: f64,
         adjustment: Option<MarketAdjustment>,
         session_type: Option<SessionType>,
         currency: Option<String>,
+        allow_partial: bool,
+        drop_incomplete_last_bar: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = HistoryOptions::parse(
+            n_bars,
             from_timestamp,
             max_bars,
             max_pages,
@@ -407,6 +297,8 @@ impl TradingViewClient {
             adjustment,
             session_type,
             currency,
+            allow_partial,
+            drop_incomplete_last_bar,
         )?;
         let auth_token = self
             .auth_token
@@ -418,11 +310,14 @@ impl TradingViewClient {
         future_into_py(py, async move {
             let client = HistoricalClient::new(&auth_token, target_server);
             let req = options
-                .request(interval, n_bars, with_replay)
+                .request(interval, with_replay)
                 .for_symbol(&symbol, &exchange);
 
             let hist_result = client.retrieve(req).await.map_err(to_py_err)?;
-            let series = series_from_result(symbol, exchange, interval, hist_result);
+            if as_dataframe && !options.allow_partial {
+                require_complete(&format!("{exchange}:{symbol}"), &hist_result)?;
+            }
+            let series = series_from_result(symbol, exchange, interval, &hist_result);
 
             if as_dataframe {
                 Python::attach(|py| {
@@ -439,6 +334,9 @@ impl TradingViewClient {
     }
 
     /// Retrieve historical data directly as a Polars DataFrame.
+    ///
+    /// An incomplete paginated history raises `IncompleteHistoryError` unless
+    /// `allow_partial=True`.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         symbol,
@@ -456,6 +354,8 @@ impl TradingViewClient {
         adjustment = None,
         session_type = None,
         currency = None,
+        allow_partial = false,
+        drop_incomplete_last_bar = false,
     ))]
     pub fn get_historical_df<'py>(
         &self,
@@ -463,17 +363,19 @@ impl TradingViewClient {
         symbol: String,
         exchange: String,
         interval: Interval,
-        n_bars: Option<u64>,
+        n_bars: Option<i64>,
         with_replay: bool,
         server: Option<DataServer>,
         from_timestamp: Option<i64>,
-        max_bars: Option<u64>,
-        max_pages: Option<u32>,
-        page_size: u64,
+        max_bars: Option<i64>,
+        max_pages: Option<i64>,
+        page_size: i64,
         page_delay: f64,
         adjustment: Option<MarketAdjustment>,
         session_type: Option<SessionType>,
         currency: Option<String>,
+        allow_partial: bool,
+        drop_incomplete_last_bar: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         self.get_historical(
             py,
@@ -492,14 +394,18 @@ impl TradingViewClient {
             adjustment,
             session_type,
             currency,
+            allow_partial,
+            drop_incomplete_last_bar,
         )
     }
 
     /// Retrieve historical OHLCV data for multiple symbols concurrently.
     ///
-    /// If `as_dataframe=True`, returns a dictionary mapping "EXCHANGE:SYMBOL" to Polars DataFrames.
-    /// At most `max_concurrency` WebSocket connections are opened; each fetches its
-    /// share of the symbols one after another. Symbols that fail are left out.
+    /// Returns a `HistoricalBatch`: a dict mapping "EXCHANGE:SYMBOL" to a
+    /// `HistoricalSeries` (or a Polars DataFrame with `as_dataframe=True`), whose
+    /// `.failed` maps every symbol left out to its error message. At most
+    /// `max_concurrency` WebSocket connections are opened; each fetches its share
+    /// of the symbols one after another.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         symbols,
@@ -517,26 +423,31 @@ impl TradingViewClient {
         adjustment = None,
         session_type = None,
         currency = None,
+        allow_partial = false,
+        drop_incomplete_last_bar = false,
     ))]
     pub fn get_historical_batch<'py>(
         &self,
         py: Python<'py>,
         symbols: Vec<(String, String)>,
         interval: Interval,
-        n_bars: Option<u64>,
-        max_concurrency: usize,
+        n_bars: Option<i64>,
+        max_concurrency: i64,
         as_dataframe: bool,
         server: Option<DataServer>,
         from_timestamp: Option<i64>,
-        max_bars: Option<u64>,
-        max_pages: Option<u32>,
-        page_size: u64,
+        max_bars: Option<i64>,
+        max_pages: Option<i64>,
+        page_size: i64,
         page_delay: f64,
         adjustment: Option<MarketAdjustment>,
         session_type: Option<SessionType>,
         currency: Option<String>,
+        allow_partial: bool,
+        drop_incomplete_last_bar: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let options = HistoryOptions::parse(
+            n_bars,
             from_timestamp,
             max_bars,
             max_pages,
@@ -545,7 +456,14 @@ impl TradingViewClient {
             adjustment,
             session_type,
             currency,
+            allow_partial,
+            drop_incomplete_last_bar,
         )?;
+        let max_concurrency = usize::try_from(max_concurrency).map_err(|_| {
+            PyValueError::new_err(format!(
+                "max_concurrency must be a non-negative integer, got {max_concurrency}"
+            ))
+        })?;
         let auth_token = self
             .auth_token
             .read()
@@ -559,38 +477,21 @@ impl TradingViewClient {
                 max_concurrency,
                 per_symbol_timeout: Duration::from_secs(30),
             };
-            let template = options.request(interval, n_bars, false);
+            let template = options.request(interval, false);
 
             let batch_result = client
                 .retrieve_batch_with(&symbols, &template, config)
                 .await;
 
-            let mut series_map = HashMap::new();
-            for sym_res in batch_result.successful {
-                if let Ok(hist_result) = sym_res.result {
-                    let key = format!("{}:{}", sym_res.exchange, sym_res.symbol);
-                    series_map.insert(
-                        key,
-                        series_from_result(sym_res.symbol, sym_res.exchange, interval, hist_result),
-                    );
-                }
-            }
-
-            if as_dataframe {
-                Python::attach(|py| {
-                    let dict = PyDict::new(py);
-                    for (k, series) in series_map {
-                        let df = series.to_polars(py)?;
-                        dict.set_item(k, df)?;
-                    }
-                    Ok(dict.into_any().unbind())
-                })
-            } else {
-                Python::attach(|py| {
-                    let py_map = series_map.into_pyobject(py)?;
-                    Ok(py_map.into_any().unbind())
-                })
-            }
+            Python::attach(|py| {
+                batch_to_python(
+                    py,
+                    batch_result,
+                    interval,
+                    as_dataframe,
+                    options.allow_partial,
+                )
+            })
         })
     }
 

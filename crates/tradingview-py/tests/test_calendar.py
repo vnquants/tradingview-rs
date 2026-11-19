@@ -38,6 +38,7 @@ def test_economic_event_model() -> None:
     assert d["actual"] == 180000.0
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_get_economic_calendar() -> None:
     client = TradingViewClient()
@@ -55,6 +56,7 @@ async def test_get_economic_calendar() -> None:
     await client.close()
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_get_economic_calendar_polars_dataframe() -> None:
     import polars as pl

@@ -60,6 +60,19 @@ pub(crate) struct ErrorRecoveryConfig {
     health_check_interval: Duration,
 }
 
+impl ErrorRecoveryConfig {
+    /// Configuration for a one-shot connection (historical fetches): never
+    /// reconnect, because a new connection has none of the old chart
+    /// sessions, and give up connecting after `connection_timeout`.
+    pub(crate) fn one_shot(connection_timeout: Duration) -> Self {
+        Self {
+            max_recovery_attempts: 0,
+            connection_timeout,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ErrorRecoveryConfig {
     fn default() -> Self {
         Self {
@@ -279,6 +292,9 @@ pub struct WebSocketClient<T: Handler> {
     // Circuit breaker state
     circuit_breaker_open: Arc<AtomicBool>,
     circuit_breaker_opened_at: Arc<RwLock<Option<Instant>>>,
+
+    /// WebSocket URL override; `None` uses `wss://{server}.tradingview.com/socket.io/websocket`.
+    endpoint: Option<Url>,
 }
 
 /// Stops a [`WebSocketClient`]'s background tasks on drop.
@@ -311,6 +327,11 @@ impl<T: Handler> WebSocketClient<T> {
     ///
     /// In accordance with TradingView's protocol, if `auth_token` is `None` or omitted,
     /// the anonymous default token (`"unauthorized_user_token"`) is transmitted.
+    ///
+    /// `endpoint` replaces the default `wss://{server}.tradingview.com/socket.io/websocket`
+    /// URL, for example to reach a proxy or a local test server. The auth token is sent to
+    /// whatever endpoint is configured. Connecting, including the WebSocket handshake, is
+    /// bounded by the error configuration's connection timeout (30 s by default).
     #[builder]
     pub async fn new(
         auth_token: Option<&str>,
@@ -318,14 +339,22 @@ impl<T: Handler> WebSocketClient<T> {
         handler: T,
         #[builder(default = 1024*1024)] buffer_size: usize,
         #[builder(default)] error_config: ErrorRecoveryConfig,
+        endpoint: Option<Url>,
     ) -> Result<Arc<Self>> {
-        let (write, read) = Self::connect(server, Some(buffer_size)).await?;
+        let (write, read) = Self::connect(
+            server,
+            Some(buffer_size),
+            endpoint.as_ref(),
+            error_config.connection_timeout,
+        )
+        .await?;
         Self::init_with_stream(
             handler,
             server,
             auth_token,
             buffer_size,
             error_config,
+            endpoint,
             write,
             read,
         )
@@ -334,12 +363,14 @@ impl<T: Handler> WebSocketClient<T> {
 
     /// Internal initialization with pre-connected WebSocket stream sink and stream.
     /// Performs initial authentication and starts health monitoring before returning.
+    #[allow(clippy::too_many_arguments)]
     async fn init_with_stream(
         handler: T,
         server: DataServer,
         auth_token: Option<&str>,
         buffer_size: usize,
         error_config: ErrorRecoveryConfig,
+        endpoint: Option<Url>,
         write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
         read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     ) -> Result<Arc<Self>> {
@@ -368,6 +399,7 @@ impl<T: Handler> WebSocketClient<T> {
             health_metrics: Arc::new(RwLock::new(HealthMetrics::default())),
             circuit_breaker_open: Arc::new(AtomicBool::new(false)),
             circuit_breaker_opened_at: Arc::new(RwLock::new(None)),
+            endpoint,
         });
 
         // Spawn the dedicated writer task.
@@ -479,13 +511,18 @@ impl<T: Handler> WebSocketClient<T> {
     async fn connect(
         server: DataServer,
         buffer_size: Option<usize>,
+        endpoint: Option<&Url>,
+        connect_timeout: Duration,
     ) -> Result<(
         SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
         SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     )> {
-        let url = Url::parse(&format!(
-            "wss://{server}.tradingview.com/socket.io/websocket"
-        ))?;
+        let url = match endpoint {
+            Some(endpoint) => endpoint.clone(),
+            None => Url::parse(&format!(
+                "wss://{server}.tradingview.com/socket.io/websocket"
+            ))?,
+        };
 
         let buffer_size = buffer_size.unwrap_or(1024 * 1024);
 
@@ -497,7 +534,16 @@ impl<T: Handler> WebSocketClient<T> {
             .read_buffer_size(buffer_size)
             .write_buffer_size(buffer_size);
 
-        let (socket, response) = connect_async_with_config(request, Some(conf), false).await?;
+        let (socket, response) = timeout(
+            connect_timeout,
+            connect_async_with_config(request, Some(conf), false),
+        )
+        .await
+        .map_err(|_| {
+            Error::WebSocket(ustr(&format!(
+                "timed out after {connect_timeout:?} connecting to the data server"
+            )))
+        })??;
 
         info!("WebSocket connected with status: {}", response.status());
 
@@ -846,7 +892,13 @@ impl<T: Handler> WebSocketClient<T> {
         }
         drop(wh);
 
-        let (write, read) = Self::connect(self.server, Some(self.buffer_size)).await?;
+        let (write, read) = Self::connect(
+            self.server,
+            Some(self.buffer_size),
+            self.endpoint.as_ref(),
+            self.error_config.connection_timeout,
+        )
+        .await?;
 
         // Create a new channel and spawn a new writer task.
         let (new_tx, new_rx) = mpsc::channel(1024);
@@ -1433,9 +1485,9 @@ impl<T: Handler> Socket for WebSocketClient<T> {
                                 ustr("event_loop_read"),
                             ).await?;
 
-                            // For connection errors, we should break the loop
-                            if e.to_string().contains("ConnectionClosed") ||
-                               e.to_string().contains("ConnectionReset") {
+                            // The connection is gone: stop reading.
+                            if is_terminal_read_error(&e) {
+                                self.is_closed.store(true, Ordering::Relaxed);
                                 break;
                             }
                         }
@@ -1623,6 +1675,20 @@ impl<T: Handler> Socket for WebSocketClient<T> {
             }
         }
     }
+}
+
+/// Whether a read error means the connection cannot deliver more messages.
+fn is_terminal_read_error(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::{Error as WsError, error::ProtocolError};
+    matches!(
+        error,
+        WsError::ConnectionClosed
+            | WsError::AlreadyClosed
+            | WsError::Io(_)
+            | WsError::Protocol(
+                ProtocolError::ResetWithoutClosingHandshake | ProtocolError::SendAfterClosing
+            )
+    )
 }
 
 /// Route a decoded socket message through the handler's event and quote callbacks.
@@ -1849,6 +1915,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_connect_times_out_when_handshake_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let holder = tokio::spawn(async move {
+            // Accept TCP but never answer the WebSocket handshake.
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(stream);
+        });
+        let endpoint = Url::parse(&format!("ws://{server_addr}/socket.io/websocket")).unwrap();
+        let started = Instant::now();
+        let result = WebSocketClient::builder()
+            .handler(MockHandler::new())
+            .endpoint(endpoint)
+            .error_config(ErrorRecoveryConfig::one_shot(Duration::from_millis(200)))
+            .build()
+            .await;
+        holder.abort();
+
+        let error = result.err().expect("handshake must time out");
+        assert!(matches!(error, Error::WebSocket(_)), "{error}");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_terminal_read_errors() {
+        use tokio_tungstenite::tungstenite::{Error as WsError, error::ProtocolError};
+        assert!(is_terminal_read_error(&WsError::ConnectionClosed));
+        assert!(is_terminal_read_error(&WsError::AlreadyClosed));
+        assert!(is_terminal_read_error(&WsError::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake
+        )));
+        assert!(is_terminal_read_error(&WsError::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        ))));
+        assert!(!is_terminal_read_error(&WsError::Utf8(String::new())));
+    }
+
+    #[tokio::test]
     async fn test_local_ws_peer_observes_auth_first_and_session_order() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
@@ -1875,6 +1981,7 @@ mod tests {
             Some("test_token_secret"),
             1024 * 1024,
             ErrorRecoveryConfig::default(),
+            None,
             write,
             read,
         )
@@ -1944,6 +2051,7 @@ mod tests {
             None,
             1024 * 1024,
             ErrorRecoveryConfig::default(),
+            None,
             write,
             read,
         )
@@ -1977,6 +2085,7 @@ mod tests {
             None,
             1024 * 1024,
             ErrorRecoveryConfig::default(),
+            None,
             write,
             read,
         )
@@ -2076,6 +2185,7 @@ mod tests {
             None,
             1024 * 1024,
             ErrorRecoveryConfig::default(),
+            None,
             write,
             read,
         )

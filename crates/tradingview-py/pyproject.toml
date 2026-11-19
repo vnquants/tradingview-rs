@@ -59,6 +59,9 @@ cache-keys = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "network: talks to TradingView over the network; deselect with -m 'not network'",
+]
 
 [tool.mypy]
 python_version = "3.12"

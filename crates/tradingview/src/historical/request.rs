@@ -32,21 +32,38 @@ pub const DEFAULT_PAGE_DELAY: Duration = Duration::from_millis(500);
 ///
 /// - the oldest bar is at or before `from_timestamp`;
 /// - at least `max_bars` distinct bars were received;
-/// - the server reports the start of the symbol's history or the account's
-///   bar limit (`data_completed` of `end` or `limit` in `series_completed`);
+/// - the server reports the start of the symbol's history or the data
+///   server's bar limit (`data_completed` of `end` or `limit` in
+///   `series_completed`);
 /// - a page adds no older bar;
-/// - `max_pages` pages were requested ([`DEFAULT_MAX_PAGES`] when unset);
-/// - a page does not complete within [`timeout`](Self::timeout).
+/// - `max_pages` pages were requested ([`DEFAULT_MAX_PAGES`] when unset).
+///
+/// A page that does not complete within [`timeout`](Self::timeout), or a
+/// connection that closes during the walk, is an error unless
+/// [`allow_partial`](Self::allow_partial) is set; then the bars received so far
+/// are returned with
+/// [`PaginationStop::Timeout`](crate::historical::PaginationStop::Timeout) or
+/// [`PaginationStop::ConnectionClosed`](crate::historical::PaginationStop::ConnectionClosed).
 ///
 /// Bars are de-duplicated by timestamp (the last update wins) and returned in
 /// ascending order. Bars older than `from_timestamp` are dropped, and with
 /// `max_bars` only the newest `max_bars` bars are kept.
 /// [`HistoricalResult::pagination_stop`](crate::historical::HistoricalResult::pagination_stop)
-/// tells which condition ended the walk.
+/// tells which condition ended the walk and
+/// [`HistoricalResult::is_complete`](crate::historical::HistoricalResult::is_complete)
+/// whether the request's target was met.
 ///
-/// Pagination cannot go past the server-side bar limit of the session: the
-/// server answers further pages with `data_completed: "limit"`. See
-/// `docs/history-depth.md` for measured limits.
+/// Pagination cannot go past the bar limit of the data server (not of the
+/// account: anonymous and token sessions measured the same): the server
+/// answers further pages with `data_completed: "limit"`. On 2026-11-19 that was
+/// about 5,000-8,000 bars on `DataServer::Data` and about 10,000-16,500 on
+/// `DataServer::ProData`. See `docs/history-depth.md`.
+///
+/// # Validation
+///
+/// [`HistoricalClient::retrieve`](crate::historical::HistoricalClient::retrieve)
+/// rejects a request without symbol and exchange, and a `from_timestamp` in the
+/// future or above 10^11 (which looks like milliseconds), before connecting.
 ///
 /// # Example
 ///
@@ -114,7 +131,18 @@ pub struct HistoricalRequest {
     /// Convert prices to this currency (`currency-id`). `None` keeps the
     /// symbol's own currency.
     pub currency: Option<Currency>,
+    /// Return the bars received so far, instead of an error, when a page
+    /// times out or the connection closes during pagination.
+    #[builder(default = false)]
+    pub allow_partial: bool,
+    /// Drop the newest bar when it had not closed yet when the fetch finished
+    /// (judged from the server's `lbs.bar_close_time` and the local clock).
+    #[builder(default = false)]
+    pub drop_incomplete_last_bar: bool,
 }
+
+/// Largest accepted `from_timestamp`: larger values look like milliseconds.
+pub const MAX_FROM_TIMESTAMP: i64 = 100_000_000_000;
 
 /// Pagination settings derived from a [`HistoricalRequest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +159,9 @@ pub struct PaginationPlan {
     pub page_delay: Duration,
     /// Time allowed for each page to complete.
     pub page_timeout: Duration,
+    /// Return partial data instead of an error on a page timeout or a closed
+    /// connection.
+    pub allow_partial: bool,
 }
 
 impl HistoricalRequest {
@@ -143,6 +174,33 @@ impl HistoricalRequest {
             (None, _) => Err(crate::error::TradingViewError::MissingSymbol.into()),
             (_, None) => Err(crate::error::TradingViewError::MissingExchange.into()),
         }
+    }
+
+    /// Check the request before any connection is made: symbol and exchange
+    /// must be set, and `from_timestamp` must be Unix seconds no later than now.
+    pub fn validate(&self) -> crate::Result<()> {
+        self.resolve_symbol_exchange()?;
+        if let Some(from) = self.from_timestamp {
+            Self::check_from_timestamp(from)?;
+        }
+        Ok(())
+    }
+
+    /// Reject a `from_timestamp` above [`MAX_FROM_TIMESTAMP`] (it looks like
+    /// milliseconds) or later than now.
+    pub fn check_from_timestamp(from: i64) -> crate::Result<()> {
+        if from > MAX_FROM_TIMESTAMP {
+            return Err(crate::Error::ChronoOutOfRange(
+                format!("from_timestamp {from} looks like milliseconds; pass Unix seconds").into(),
+            ));
+        }
+        let now = chrono::Utc::now().timestamp();
+        if from > now {
+            return Err(crate::Error::ChronoOutOfRange(
+                format!("from_timestamp {from} is in the future (now {now})").into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Whether this request walks back with `request_more_data`.
@@ -159,6 +217,7 @@ impl HistoricalRequest {
             page_size: self.page_size.max(1),
             page_delay: self.page_delay,
             page_timeout: self.timeout,
+            allow_partial: self.allow_partial,
         })
     }
 
@@ -192,6 +251,8 @@ mod tests {
         assert_eq!(request.adjustment, None);
         assert_eq!(request.session_type, None);
         assert_eq!(request.currency, None);
+        assert!(!request.allow_partial);
+        assert!(!request.drop_incomplete_last_bar);
     }
 
     #[test]
@@ -211,6 +272,42 @@ mod tests {
         assert_eq!(plan.page_timeout, by_time.timeout);
         assert_eq!(by_count.pagination_plan().unwrap().max_bars, Some(20_000));
         assert_eq!(by_pages.pagination_plan().unwrap().max_pages, 3);
+    }
+
+    #[test]
+    fn test_validate_rejects_future_and_millisecond_from_timestamp() {
+        let base = || {
+            HistoricalRequest::builder()
+                .symbol("VCB".to_string())
+                .exchange("HOSE".to_string())
+        };
+        assert!(base().build().validate().is_ok());
+        assert!(base().from_timestamp(0).build().validate().is_ok());
+        assert!(
+            base()
+                .from_timestamp(1_735_689_600)
+                .build()
+                .validate()
+                .is_ok()
+        );
+
+        let future = chrono::Utc::now().timestamp() + 3_600;
+        let error = base()
+            .from_timestamp(future)
+            .build()
+            .validate()
+            .unwrap_err();
+        assert!(error.to_string().contains("in the future"), "{error}");
+
+        let millis = base()
+            .from_timestamp(1_735_689_600_000)
+            .build()
+            .validate()
+            .unwrap_err();
+        assert!(millis.to_string().contains("milliseconds"), "{millis}");
+
+        let missing = HistoricalRequest::builder().build().validate();
+        assert!(missing.is_err());
     }
 
     #[test]

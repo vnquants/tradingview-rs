@@ -2,11 +2,13 @@
 
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from enum import Enum
-from typing import Any, Literal, TypeAlias
+from typing import Any, ClassVar, Literal, TypeAlias
 
+from tradingview._batch import HistoricalBatch as HistoricalBatch
 from tradingview.exceptions import (
     AuthenticationError,
     ConnectionError,
+    IncompleteHistoryError,
     ProtocolError,
     RateLimitError,
     SymbolNotFoundError,
@@ -55,29 +57,46 @@ class DataServer(Enum):
     WidgetData = "widgetdata"
     MobileData = "mobile-data"
 
-class MarketAdjustment(Enum):
+class MarketAdjustment:
     """Price adjustment applied to historical bars.
 
-    Without an adjustment TradingView applies `Splits`. Symbols that do not
-    support adjustments (for example crypto pairs) return the same bars for
-    every value.
+    A native enum (not an `enum.Enum`): members are class attributes with `name`
+    and `value` and compare with `==`; they are not hashable. Without an
+    adjustment TradingView applies `Splits`. Symbols that do not support
+    adjustments (for example crypto pairs) return the same bars for every value.
     """
 
-    Splits = "splits"
-    """Adjust for splits and stock dividends (the server default)."""
-    Dividends = "dividends"
-    """Adjust for splits and cash dividends (back-adjusted prices)."""
-    Unadjusted = "none"
-    """Raw traded prices without any adjustment."""
+    Splits: ClassVar[MarketAdjustment]
+    """Adjust for splits and stock dividends (the server default); value `"splits"`."""
+    Dividends: ClassVar[MarketAdjustment]
+    """Adjust for splits and cash dividends (back-adjusted prices); value `"dividends"`."""
+    Unadjusted: ClassVar[MarketAdjustment]
+    """Raw traded prices without any adjustment; value `"none"`."""
 
-class SessionType(Enum):
-    """Trading session of historical bars. Without a session TradingView returns `Regular`."""
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> str: ...
 
-    Regular = "regular"
-    Extended = "extended"
-    """Regular hours plus pre- and post-market."""
-    PreMarket = "premarket"
-    PostMarket = "postmarket"
+class SessionType:
+    """Trading session of historical bars. Without a session TradingView returns `Regular`.
+
+    A native enum (not an `enum.Enum`), like `MarketAdjustment`.
+    """
+
+    Regular: ClassVar[SessionType]
+    """Regular trading hours; value `"regular"`."""
+    Extended: ClassVar[SessionType]
+    """Regular hours plus pre- and post-market; value `"extended"`."""
+    PreMarket: ClassVar[SessionType]
+    """Pre-market only; value `"premarket"`."""
+    PostMarket: ClassVar[SessionType]
+    """Post-market only; value `"postmarket"`."""
+
+    @property
+    def name(self) -> str: ...
+    @property
+    def value(self) -> str: ...
 
 PaginationStop: TypeAlias = Literal[
     "reached_from",
@@ -87,6 +106,7 @@ PaginationStop: TypeAlias = Literal[
     "bar_limit",
     "no_more_data",
     "timeout",
+    "connection_closed",
 ]
 """Why pagination stopped walking back (`HistoricalSeries.pagination_stop`)."""
 
@@ -203,6 +223,10 @@ class HistoricalSeries:
     """Number of `request_more_data` pages sent (0 without pagination)."""
     pagination_stop: PaginationStop | None
     """Why pagination stopped, or None without pagination."""
+    dropped_rows: int
+    """Bar rows the server sent that could not be parsed and were dropped."""
+    last_bar_complete: bool | None
+    """Whether the last bar had closed when the fetch finished (local clock); None when unknown."""
 
     def __init__(
         self,
@@ -214,7 +238,15 @@ class HistoricalSeries:
         symbol_info: SymbolInfo | None = None,
         pages_fetched: int = 0,
         pagination_stop: str | None = None,
+        dropped_rows: int = 0,
+        last_bar_complete: bool | None = None,
     ) -> None: ...
+    @property
+    def is_complete(self) -> bool:
+        """True without pagination, or when pagination stopped at `from_timestamp`,
+        `max_bars` or the start of history (`reached_from`, `reached_max_bars`,
+        `end_of_history`). False after `bar_limit`, `max_pages`, `no_more_data`,
+        `timeout` or `connection_closed`, when older bars may exist."""
     def __len__(self) -> int: ...
     def __getitem__(self, index: int) -> Bar: ...
     def __iter__(self) -> Iterator[Bar]: ...
@@ -460,37 +492,48 @@ class TradingViewClient:
         adjustment: MarketAdjustment | None = None,
         session_type: SessionType | None = None,
         currency: str | None = None,
+        allow_partial: bool = False,
+        drop_incomplete_last_bar: bool = False,
     ) -> Any:
         """Fetch OHLCV bars for one symbol.
 
         Returns a `HistoricalSeries`, or a Polars DataFrame when `as_dataframe=True`.
 
         Args:
-            n_bars: Bars in the first request. Defaults to 100 without pagination
-                and to `page_size` (capped at `max_bars`) with pagination.
+            n_bars: Bars in the first request (positive). Defaults to 100 without
+                pagination and to `page_size` (capped at `max_bars`) with pagination.
             with_replay: Has no effect; kept for compatibility.
             server: Data server override. `DataServer.ProData` serves about twice
                 as many bars as the default `DataServer.Data`.
-            from_timestamp: Oldest bar wanted (Unix seconds). Enables pagination;
-                older bars are dropped from the result.
-            max_bars: Bars wanted in total. Enables pagination; only the newest
-                `max_bars` bars are returned.
-            max_pages: Maximum `request_more_data` pages (default 100 when
-                pagination is enabled by another keyword). Enables pagination on its own.
-            page_size: Bars requested per page.
-            page_delay: Seconds to wait before each page.
+            from_timestamp: Oldest bar wanted, in Unix seconds, not in the future.
+                Enables pagination; older bars are dropped from the result.
+            max_bars: Bars wanted in total (positive). Enables pagination; only the
+                newest `max_bars` bars are returned.
+            max_pages: Maximum `request_more_data` pages (0 or more; default 100
+                when another keyword enabled pagination). Enables pagination on its own.
+            page_size: Bars requested per page (positive).
+            page_delay: Seconds to wait before each page (non-negative).
             adjustment: Price adjustment; the server default is `Splits`.
             session_type: Trading session; the server default is `Regular`.
             currency: ISO 4217 code to convert prices to, e.g. `"USD"`.
+            allow_partial: Return the bars received so far, instead of raising,
+                when a page times out or the connection closes during pagination;
+                with `as_dataframe=True`, also return incomplete histories.
+            drop_incomplete_last_bar: Drop the newest bar if it had not closed yet.
 
         Pagination stops at `from_timestamp` or `max_bars`, when the server reports
-        the start of history or its bar limit, when a page adds no older bar,
-        after `max_pages` pages, or when a page times out (the bars received so far
-        are returned). See `HistoricalSeries.pagination_stop`.
+        the start of history or its bar limit, when a page adds no older bar, or
+        after `max_pages` pages. See `HistoricalSeries.pagination_stop` and
+        `HistoricalSeries.is_complete`.
 
         Raises:
-            ValueError: If `page_size` or `max_bars` is 0, `page_delay` is negative,
-                or `currency` is not an ISO 4217 code.
+            ValueError: Invalid keywords. Raised when the method is called, before
+                the coroutine is awaited.
+            TimeoutError: The initial load or, without `allow_partial`, a page timed out.
+            ConnectionError: The connection failed or, without `allow_partial`,
+                closed during pagination.
+            IncompleteHistoryError: `as_dataframe=True` and the history is
+                incomplete (`is_complete` would be False), without `allow_partial`.
         """
     async def get_historical_df(
         self,
@@ -509,8 +552,14 @@ class TradingViewClient:
         adjustment: MarketAdjustment | None = None,
         session_type: SessionType | None = None,
         currency: str | None = None,
+        allow_partial: bool = False,
+        drop_incomplete_last_bar: bool = False,
     ) -> Any:
-        """`get_historical(..., as_dataframe=True)`: return a Polars DataFrame."""
+        """`get_historical(..., as_dataframe=True)`: return a Polars DataFrame.
+
+        Raises `IncompleteHistoryError` for an incomplete history unless
+        `allow_partial=True`.
+        """
     async def get_historical_batch(
         self,
         symbols: Sequence[tuple[str, str]],
@@ -528,12 +577,19 @@ class TradingViewClient:
         adjustment: MarketAdjustment | None = None,
         session_type: SessionType | None = None,
         currency: str | None = None,
-    ) -> Any:
-        """Fetch several `(symbol, exchange)` pairs; keys are `"EXCHANGE:SYMBOL"`.
+        allow_partial: bool = False,
+        drop_incomplete_last_bar: bool = False,
+    ) -> HistoricalBatch:
+        """Fetch several `(symbol, exchange)` pairs.
 
-        Takes the keywords of `get_historical`. At most `max_concurrency`
-        WebSocket connections are opened; each fetches its share of the symbols
-        one after another. Symbols that fail are left out of the result.
+        Returns a `HistoricalBatch`, a dict keyed by `"EXCHANGE:SYMBOL"` whose
+        `failed` attribute maps every symbol left out to its error message
+        (including, with `as_dataframe=True` and without `allow_partial`,
+        incomplete histories). Takes the keywords of `get_historical`; invalid
+        keywords raise `ValueError` when the method is called. At most
+        `max_concurrency` WebSocket connections are opened; each fetches its share
+        of the symbols one after another, and a symbol whose connection failed is
+        retried once on a new connection.
         """
     async def subscribe_quotes(
         self,
@@ -583,9 +639,12 @@ __all__ = [
     "FinancialPeriod",
     "FundamentalPoint",
     "FundamentalSeries",
+    "HistoricalBatch",
     "HistoricalSeries",
+    "IncompleteHistoryError",
     "Interval",
     "MarketAdjustment",
+    "PaginationStop",
     "ProtocolError",
     "QuoteSubscription",
     "QuoteTick",

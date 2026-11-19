@@ -78,10 +78,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 `page_delay` (default 500 ms) shape each page; `timeout` applies to the initial
 load and to each page. `HistoricalResult::pages_fetched` and
 `HistoricalResult::pagination_stop` (`PaginationStop::{ReachedFrom,
-ReachedMaxBars, MaxPages, EndOfHistory, BarLimit, NoMoreData, Timeout}`) report
-the walk. A page timeout returns the bars received so far; an initial timeout is
-an error. The data server's bar limit caps the depth (see
-[`history-depth.md`](history-depth.md)).
+ReachedMaxBars, MaxPages, EndOfHistory, BarLimit, NoMoreData, Timeout,
+ConnectionClosed}`, `#[non_exhaustive]`) report the walk, and
+`HistoricalResult::is_complete()` is `true` only without pagination or after
+`ReachedFrom`, `ReachedMaxBars` or `EndOfHistory`. The data server's bar limit
+caps the depth (see [`history-depth.md`](history-depth.md)).
+
+Truncation is an error by default: an initial or page timeout returns
+`Error::Timeout`, and a closed connection returns `Error::WebSocket` as soon as
+the reader notices it (no waiting for the timeout). With
+`.allow_partial(true)`, a page timeout or closed connection during pagination
+returns the bars received so far with `PaginationStop::Timeout` or
+`PaginationStop::ConnectionClosed`. Connecting, including the WebSocket
+handshake, is bounded by `timeout` too.
+
+`retrieve` validates the request first: symbol and exchange are required and
+`from_timestamp` must be Unix seconds no later than now (values above 10^11
+look like milliseconds and are rejected).
+
+Each result also carries `dropped_rows` (unparseable bar rows, logged as a
+warning), `last_bar_close_time` (the server's `lbs.bar_close_time`) and
+`last_bar_complete` (whether the newest bar had closed when the fetch
+finished); `.drop_incomplete_last_bar(true)` removes a still-forming newest bar.
+
+`HistoricalClient::with_endpoint("ws://...")` points the client at another
+WebSocket URL, for example a proxy or a local test server
+(`crates/tradingview/tests/historical_mock.rs` runs the client against one).
+The auth token is sent to that endpoint.
 
 ```rust
 use std::time::Duration;
@@ -110,7 +133,8 @@ println!(
 );
 
 // The same options for many symbols: at most `max_concurrency` connections,
-// each fetching its share of the symbols in turn.
+// each fetching its share of the symbols in turn; a symbol whose connection
+// failed is retried once on a new connection.
 let symbols = vec![("BTCUSDT".to_string(), "BINANCE".to_string())];
 let template = HistoricalRequest::builder()
     .interval(Interval::OneMinute)

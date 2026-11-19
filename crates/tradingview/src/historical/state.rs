@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use crate::error::TradingViewError;
 use crate::websocket::SeriesInfo;
 use crate::{DataPoint, OHLCV, SymbolInfo};
 
@@ -21,9 +22,17 @@ pub struct HistoricalState {
     /// load and one per `request_more_data` page.
     pub completions: u64,
     /// `data_completed` value of the latest `series_completed` message:
-    /// `"end"` at the start of the symbol's history, `"limit"` at the
-    /// session's bar limit, `None` while more data can be requested.
+    /// `"end"` at the start of the symbol's history, `"limit"` at the data
+    /// server's bar limit, `None` while more data can be requested.
     pub data_completed: Option<String>,
+    /// Bar rows that could not be parsed (malformed or without OHLC values).
+    pub dropped_rows: usize,
+    /// `lbs.bar_close_time` of the newest bar, as reported by the server.
+    pub last_bar_close_time: Option<i64>,
+    /// Why the connection closed, once it has; waiters wake up when it is set.
+    pub disconnected: Option<String>,
+    /// First TradingView protocol error (`symbol_error`, `series_error`, ...).
+    pub protocol_error: Option<TradingViewError>,
 }
 
 impl HistoricalState {
@@ -45,6 +54,10 @@ impl HistoricalState {
             notify,
             completions: 0,
             data_completed: None,
+            dropped_rows: 0,
+            last_bar_close_time: None,
+            disconnected: None,
+            protocol_error: None,
         }
     }
     pub fn with_capacity(capacity: usize) -> Self {
@@ -75,6 +88,24 @@ impl HistoricalState {
         self.data.extend(points);
         self.total_bars += total_in_batch;
     }
+    /// Count bar rows that could not be parsed.
+    pub fn record_dropped_rows(&mut self, dropped: usize) {
+        self.dropped_rows += dropped;
+    }
+    /// Remember the newest `lbs.bar_close_time` the server reported.
+    pub fn record_last_bar_close_time(&mut self, close_time: i64) {
+        self.last_bar_close_time = Some(
+            self.last_bar_close_time
+                .map_or(close_time, |known| known.max(close_time)),
+        );
+    }
+    /// Record that the connection closed and wake waiters. The first reason wins.
+    pub fn disconnect(&mut self, reason: &str) {
+        if self.disconnected.is_none() {
+            self.disconnected = Some(reason.to_string());
+        }
+        self.notify.notify_waiters();
+    }
     pub fn record_symbol_info(&mut self, info: SymbolInfo) {
         self.symbol_info = Some(info);
     }
@@ -92,13 +123,20 @@ impl HistoricalState {
         self.data_completed = data_completed;
         self.notify.notify_waiters();
     }
+    /// Record a failure and wake waiters. The first message is kept, since it
+    /// names the root cause (`symbol_error` arrives before `series_error`).
     pub fn fail(&mut self, msg: String) {
         self.errored = true;
-        self.error_message = Some(msg);
+        self.error_message.get_or_insert(msg);
         self.notify.notify_waiters();
     }
+    /// Record a TradingView protocol error; the first one is kept.
+    pub fn fail_with(&mut self, error: TradingViewError, msg: String) {
+        self.protocol_error.get_or_insert(error);
+        self.fail(msg);
+    }
     pub fn is_done(&self) -> bool {
-        self.completed || self.errored
+        self.completed || self.errored || self.disconnected.is_some()
     }
     /// Sort the bars by timestamp and keep one bar per timestamp, the one
     /// received last (a later real-time update replaces an earlier value).
@@ -188,6 +226,27 @@ mod tests {
         assert_eq!(state.bar_count_and_earliest(), (0, None));
         state.record_points(vec![bar(200, 2.0), bar(100, 1.0), bar(200, 2.1)], 3);
         assert_eq!(state.bar_count_and_earliest(), (2, Some(100)));
+    }
+
+    #[test]
+    fn test_disconnect_keeps_first_reason_and_marks_done() {
+        let mut state = HistoricalState::new();
+        assert!(!state.is_done());
+        state.disconnect("server closed");
+        state.disconnect("later");
+        assert_eq!(state.disconnected.as_deref(), Some("server closed"));
+        assert!(state.is_done());
+    }
+
+    #[test]
+    fn test_last_bar_close_time_keeps_newest() {
+        let mut state = HistoricalState::new();
+        state.record_last_bar_close_time(200);
+        state.record_last_bar_close_time(100);
+        assert_eq!(state.last_bar_close_time, Some(200));
+        state.record_dropped_rows(2);
+        state.record_dropped_rows(1);
+        assert_eq!(state.dropped_rows, 3);
     }
 
     #[test]

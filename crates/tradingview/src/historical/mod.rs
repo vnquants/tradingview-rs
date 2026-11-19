@@ -40,6 +40,7 @@ pub mod state;
 pub use batch::{BatchConfig, BatchResult, BatchSymbolResult};
 pub use client::HistoricalClient;
 pub use request::{
-    DEFAULT_MAX_PAGES, DEFAULT_PAGE_DELAY, DEFAULT_PAGE_SIZE, HistoricalRequest, PaginationPlan,
+    DEFAULT_MAX_PAGES, DEFAULT_PAGE_DELAY, DEFAULT_PAGE_SIZE, HistoricalRequest,
+    MAX_FROM_TIMESTAMP, PaginationPlan,
 };
 pub use result::{HistoricalResult, PaginationStop};
