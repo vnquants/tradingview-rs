@@ -17,6 +17,7 @@
 //! | `DONECLOSE` / `DONEDROP` | completes the initial load, then sends a close frame / drops the connection |
 //! | `FLAKY` | drops the connection on the first `create_series` for that name, then works |
 //! | `FORMING` | newest bar closes 30 min from now (`lbs.bar_close_time`) |
+//! | `CLOSED` | newest bar closed a day ago |
 //! | `DELAYED` | `delay: 900`; newest bar's nominal close was 60 s ago |
 //! | `SKEWAHEAD` | messages carry server time `t`/`t_ms` 60 s behind the local clock; the bar closes 5 s after server now |
 //! | `SKEWBEHIND` | server time 60 s ahead of the local clock; the bar closed 10 s before server now |
@@ -91,6 +92,8 @@ fn last_bar_close_time(name: &str) -> Option<i64> {
     let server_now = local_now() + server_skew(name).unwrap_or(0);
     if name.starts_with("FORMING") {
         Some(server_now + 1800)
+    } else if name.starts_with("CLOSED") {
+        Some(server_now - 86_400)
     } else if name.starts_with("DELAYED") {
         Some(server_now - 60)
     } else if name.starts_with("SKEWAHEAD") {
@@ -734,4 +737,109 @@ async fn last_bar_complete_uses_the_server_clock_not_the_local_clock() {
     request.drop_incomplete_last_bar = true;
     let dropped = server.client().retrieve(request).await.unwrap();
     assert_eq!(dropped.len(), 9);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn max_bars_target_met_is_complete_whatever_stopped_the_walk() {
+    // (last bar, drop_incomplete_last_bar, max_bars, max_pages) -> (bars, stop, pages)
+    let cases = [
+        (
+            "FORMING",
+            true,
+            30u64,
+            None,
+            30,
+            PaginationStop::ReachedMaxBars,
+            3,
+        ),
+        (
+            "CLOSED",
+            true,
+            30,
+            None,
+            30,
+            PaginationStop::ReachedMaxBars,
+            3,
+        ),
+        (
+            "CLOSED",
+            false,
+            20,
+            Some(1u32),
+            20,
+            PaginationStop::ReachedMaxBars,
+            1,
+        ),
+        // Aims for 21 bars, max_pages stops at 20, all closed: target met.
+        (
+            "CLOSED",
+            true,
+            20,
+            Some(1),
+            20,
+            PaginationStop::ReachedMaxBars,
+            1,
+        ),
+        // Same walk, but the newest bar is forming: only 19 closed bars.
+        (
+            "FORMING",
+            true,
+            20,
+            Some(1),
+            19,
+            PaginationStop::MaxPages,
+            1,
+        ),
+        (
+            "CLOSED",
+            false,
+            10,
+            None,
+            10,
+            PaginationStop::ReachedMaxBars,
+            0,
+        ),
+        // max_bars a multiple of the page size: the extra bar costs a page.
+        (
+            "CLOSED",
+            true,
+            10,
+            None,
+            10,
+            PaginationStop::ReachedMaxBars,
+            1,
+        ),
+        (
+            "FORMING",
+            true,
+            10,
+            None,
+            10,
+            PaginationStop::ReachedMaxBars,
+            1,
+        ),
+    ];
+    let server = MockServer::start().await;
+    for (name, drop, max_bars, max_pages, bars, stop, pages) in cases {
+        let request = HistoricalRequest::builder()
+            .symbol(name.to_string())
+            .exchange("MOCK".to_string())
+            .interval(Interval::OneHour)
+            .max_bars(max_bars)
+            .page_size(10)
+            .page_delay(Duration::ZERO)
+            .maybe_max_pages(max_pages)
+            .drop_incomplete_last_bar(drop)
+            .timeout(Duration::from_secs(5))
+            .build();
+        let case = format!("{name} drop={drop} max_bars={max_bars} max_pages={max_pages:?}");
+        let result = server.client().retrieve(request).await.unwrap();
+        assert_eq!(result.len(), bars, "{case}");
+        assert_eq!(result.pagination_stop, Some(stop), "{case}");
+        assert_eq!(result.pages_fetched, pages, "{case}");
+        assert_eq!(result.is_complete(), stop.is_complete(), "{case}");
+        if drop {
+            assert_ne!(result.last_bar_complete, Some(false), "{case}");
+        }
+    }
 }

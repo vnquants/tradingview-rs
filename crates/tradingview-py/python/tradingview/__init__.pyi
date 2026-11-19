@@ -522,7 +522,8 @@ class TradingViewClient:
                 with `as_dataframe=True`, also return incomplete histories.
             drop_incomplete_last_bar: Drop the newest bar if it had not closed yet (see
                 `HistoricalSeries.last_bar_complete`); with `max_bars`, exactly
-                `max_bars` closed bars are returned.
+                `max_bars` closed bars are returned, at the cost of one more page
+                when `max_bars` is a multiple of `page_size`.
 
         Pagination stops at `from_timestamp` or `max_bars`, when the server reports
         the start of history or its bar limit, when a page adds no older bar, or

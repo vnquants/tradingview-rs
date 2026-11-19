@@ -103,7 +103,9 @@ that is whether the server's clock (the `t` timestamps on its messages, or the
 local clock when they are missing) had passed `lbs.bar_close_time` plus the
 symbol's feed `delay` plus 2 s. `.drop_incomplete_last_bar(true)` removes a
 still-forming newest bar; with `max_bars`, pagination collects one extra bar so
-that exactly `max_bars` closed bars remain.
+that exactly `max_bars` closed bars remain (one more page when `max_bars` is a
+multiple of the page size). A walk that another condition ends with exactly
+`max_bars` closed bars still reports `ReachedMaxBars`.
 
 A completed load stays a success when the server closes the connection right
 after `series_completed`.

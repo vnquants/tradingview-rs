@@ -140,7 +140,11 @@ pub struct HistoricalRequest {
     /// its messages, or the local clock when they are missing) passes
     /// `lbs.bar_close_time` plus the symbol's feed `delay` plus 2 s. With
     /// `max_bars`, pagination collects one extra bar so that `max_bars`
-    /// closed bars remain.
+    /// closed bars remain. That can cost one more page: when `max_bars` is a
+    /// multiple of the page size (counting the initial request), the extra
+    /// bar needs a page of its own. If another stop condition ends the walk
+    /// with exactly `max_bars` closed bars, the result still reports
+    /// [`PaginationStop::ReachedMaxBars`](crate::historical::PaginationStop::ReachedMaxBars).
     #[builder(default = false)]
     pub drop_incomplete_last_bar: bool,
 }

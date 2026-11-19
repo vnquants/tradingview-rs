@@ -298,6 +298,14 @@ impl HistoricalConnection {
                     .filter(|complete| *complete);
         }
         let data = trim_to_request(data, request.from_timestamp, request.max_bars);
+        let pagination_stop = outcome.map(|outcome| {
+            settle_stop(
+                outcome.stop,
+                request.max_bars,
+                data.len(),
+                last_bar_complete,
+            )
+        });
         Ok(HistoricalResult {
             symbol_info,
             data,
@@ -306,7 +314,7 @@ impl HistoricalConnection {
             replay_used: request.with_replay,
             elapsed: started.elapsed(),
             pages_fetched: outcome.map_or(0, |outcome| outcome.pages),
-            pagination_stop: outcome.map(|outcome| outcome.stop),
+            pagination_stop,
             dropped_rows,
             last_bar_close_time,
             last_bar_complete,
@@ -439,6 +447,27 @@ fn last_bar_completeness(
             .saturating_add(feed_delay)
             .saturating_add(LAST_BAR_MARGIN_SECS),
     )
+}
+
+/// The stop reason to report once the result is trimmed. With
+/// `drop_incomplete_last_bar`, pagination aims for `max_bars + 1` bars, so it
+/// can stop on another condition (`max_pages`, the bar limit, ...) with
+/// exactly `max_bars` bars, all closed: the caller's target was met, so report
+/// [`PaginationStop::ReachedMaxBars`]. A stop that already means complete is
+/// kept, and so is any stop when the last bar is known to be still forming.
+fn settle_stop(
+    stop: PaginationStop,
+    max_bars: Option<u64>,
+    bars: usize,
+    last_bar_complete: Option<bool>,
+) -> PaginationStop {
+    let target_met = max_bars.is_some_and(|max_bars| bars as u64 == max_bars)
+        && last_bar_complete != Some(false);
+    if target_met && !stop.is_complete() {
+        PaginationStop::ReachedMaxBars
+    } else {
+        stop
+    }
 }
 
 /// Bars for the initial `create_series`: the requested `num_bars`, or with
@@ -1493,6 +1522,30 @@ mod tests {
         // A close time that is not after the newest bar's open is unusable.
         assert_eq!(last_bar_completeness(&data, Some(4_600), 9_000, 0), None);
         assert_eq!(last_bar_completeness(&[], Some(8_200), 9_000, 0), None);
+    }
+
+    #[test]
+    fn test_settle_stop_reports_a_met_max_bars_target() {
+        use PaginationStop::*;
+        // drop_incomplete_last_bar aimed for 21 bars, max_pages stopped at 20.
+        assert_eq!(
+            settle_stop(MaxPages, Some(20), 20, Some(true)),
+            ReachedMaxBars
+        );
+        assert_eq!(settle_stop(BarLimit, Some(20), 20, None), ReachedMaxBars);
+        // Fewer bars than asked, or a still-forming last bar: keep the stop.
+        assert_eq!(settle_stop(MaxPages, Some(20), 19, Some(true)), MaxPages);
+        assert_eq!(settle_stop(MaxPages, Some(20), 20, Some(false)), MaxPages);
+        assert_eq!(settle_stop(MaxPages, None, 20, Some(true)), MaxPages);
+        // A stop that already means complete is kept.
+        assert_eq!(
+            settle_stop(EndOfHistory, Some(20), 20, Some(true)),
+            EndOfHistory
+        );
+        assert_eq!(
+            settle_stop(ReachedFrom, Some(20), 20, Some(true)),
+            ReachedFrom
+        );
     }
 
     #[test]
