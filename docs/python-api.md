@@ -110,7 +110,7 @@ async def get_tradingview_token(self) -> str: ...
 
 Retrieves a TradingView session token using authenticated session cookies (`sessionid`, `sessionid_sign`, `device_t`).
 
-- **Prerequisites**: The client must have established an authenticated cookie session via `TradingViewClient.login()` or `client.authenticate()`.
+- **Prerequisites**: The client must hold an authenticated cookie session from `TradingViewClient.login()`, `client.authenticate()` or `TradingViewClient.from_cookies()`.
 - **Rejection**: Anonymous clients or token-only clients initialized via `TradingViewClient(auth_token=...)` will immediately raise `AuthenticationError` before executing any network request. A supplied auth/websocket token is not a cookie session.
 - **Token Disparity & Transport**: Token types are not equivalent; layout-sharing JWTs or standalone auth tokens do not grant cookie-authenticated HTTP session access. Authenticated cookie flows use `wreq` backed by BoringSSL, while public HTTP requests use `reqwest`; the Cargo `rustls-tls` feature applies to `reqwest` and WebSocket transport. No claim of CAPTCHA bypass is made.
 - **Token Usage**: Returns the retrieved token string without mutating the current client's `auth_token`. The token can then be passed to instantiate a client targeting `DataServer.ProData`.
@@ -139,6 +139,47 @@ data_client = TradingViewClient(
     auth_token=token,
     server=DataServer.ProData,
 )
+```
+
+### Persisting a Cookie Session (`export_cookies` / `from_cookies`)
+
+```python
+def export_cookies(self) -> str: ...
+
+@classmethod
+def from_cookies(cls, cookies_json: str, *, server: DataServer = DataServer.Data) -> TradingViewClient: ...
+```
+
+A password login is rate limited and may trigger a CAPTCHA, so log in once, save the session cookies, and rebuild a cookie-session client from them in later processes.
+
+- **Format**: `export_cookies()` returns the JSON that the Rust `UserCookies` serializes to (`id`, `username`, `private_channel`, `auth_token`, `session`, `session_signature`, `session_hash`, `device_token`). It raises `AuthenticationError` on anonymous or token-only clients.
+- **Import**: `from_cookies()` makes no network request. Only `session` (`sessionid`) and `session_signature` (`sessionid_sign`) are required, so cookies copied from a browser also work. Malformed JSON raises `ValueError`; empty session cookies raise `AuthenticationError`. Error messages never include cookie values.
+- **Restored state**: `username` and `auth_token` are restored from the JSON when present. The stored `auth_token` is the one issued at login and may have expired; call `get_tradingview_token()` for a fresh token.
+- **Storage**: the JSON holds live session secrets. Write it with owner-only permissions (mode `0600`) and keep it out of version control. If TradingView expires or revokes the session, `get_tradingview_token()` raises `AuthenticationError`; log in again and save the new cookies.
+
+```python
+import os
+from pathlib import Path
+from tradingview import AuthenticationError, TradingViewClient
+
+cookies_path = Path("cookies.json")
+
+# First run: password login, then save the cookies with mode 0600.
+client = await TradingViewClient.login(
+    username=os.environ["TRADINGVIEW_USERNAME"],
+    password=os.environ["TRADINGVIEW_PASSWORD"],
+    totp_secret=os.environ.get("TRADINGVIEW_TOTP_SECRET"),
+)
+fd = os.open(cookies_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write(client.export_cookies())
+
+# Later runs: no password login.
+client = TradingViewClient.from_cookies(cookies_path.read_text())
+try:
+    token = await client.get_tradingview_token()
+except AuthenticationError:
+    ...  # session expired or revoked: log in again and overwrite cookies.json
 ```
 
 ---

@@ -2,6 +2,7 @@ pub mod callbacks;
 pub mod client;
 pub mod errors;
 pub mod models;
+pub mod session;
 pub mod streaming;
 
 pub type PyObject = pyo3::Py<pyo3::PyAny>;

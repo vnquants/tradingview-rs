@@ -293,14 +293,57 @@ class TradingViewClient:
                 Base32 secret or a full `otpauth://totp/...` URI (e.g. from Bitwarden).
             captcha_key: Optional 2Captcha API key to automatically solve reCAPTCHA challenges.
         """
+    @classmethod
+    def from_cookies(
+        cls,
+        cookies_json: str,
+        *,
+        server: DataServer = DataServer.Data,
+    ) -> TradingViewClient:
+        """Build a cookie-session client from JSON produced by `export_cookies()`.
+
+        No network request is made. The returned client can call
+        `get_tradingview_token()` without a password login, so a session saved
+        after one `login()` can be reused across processes until TradingView
+        expires it.
+
+        Only `session` and `session_signature` are required; the other fields
+        (`id`, `username`, `private_channel`, `auth_token`, `session_hash`,
+        `device_token`) may be omitted. The stored `auth_token` is restored
+        as-is and may already have expired; call `get_tradingview_token()` for a
+        fresh token.
+
+        Args:
+            cookies_json: JSON object as returned by `export_cookies()`.
+            server: Data server for the returned client.
+
+        Raises:
+            ValueError: If `cookies_json` is not a JSON object or a field has
+                the wrong type. The message never includes cookie values.
+            AuthenticationError: If `session` or `session_signature` is empty.
+        """
+    def export_cookies(self) -> str:
+        """Export the session cookies as JSON for `TradingViewClient.from_cookies()`.
+
+        The JSON is the serialized Rust `UserCookies`: `id`, `username`,
+        `private_channel`, `auth_token`, `session`, `session_signature`,
+        `session_hash` and `device_token`. It holds live session secrets, so
+        store it with owner-only permissions (for example mode 0600) and keep it
+        out of version control.
+
+        Raises:
+            AuthenticationError: If the client has no cookie session (anonymous
+                or token-only clients).
+        """
     async def get_tradingview_token(self) -> str:
         """Retrieve a TradingView session token using authenticated session cookies.
 
-        The client must be authenticated with session cookies via `TradingViewClient.login()`
-        or `client.authenticate()`.
+        The client must hold session cookies from `TradingViewClient.login()`,
+        `client.authenticate()` or `TradingViewClient.from_cookies()`.
 
         Raises:
-            AuthenticationError: If the client is anonymous or was initialized with only an auth_token.
+            AuthenticationError: If the client is anonymous or was initialized with only
+                an auth_token, or if TradingView rejects the session cookies.
         """
     async def get_historical(
         self,

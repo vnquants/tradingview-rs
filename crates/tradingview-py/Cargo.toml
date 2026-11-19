@@ -1,6 +1,6 @@
 [package]
 name = "tradingview-py"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2024"
 authors = ["Nguyen Thanh Dat <dat.nguyen@bitbytelab.io>"]
 license = "MIT"

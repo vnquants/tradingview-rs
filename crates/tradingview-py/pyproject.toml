@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "tradingview-rs"
-version = "0.4.5"
+version = "0.4.6"
 description = "High-performance Python bindings for TradingView data provider backed by tradingview-rs"
 authors = [
     { name = "Nguyen Thanh Dat", email = "dat.nguyen@bitbytelab.io" }
@@ -45,6 +45,16 @@ dev = [
 features = ["pyo3/extension-module"]
 python-source = "python"
 module-name = "tradingview._tradingview"
+
+[tool.uv]
+# uv only watches pyproject.toml by default; rebuild the editable install when Rust changes.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "src/**/*.rs" },
+    { file = "../tradingview/Cargo.toml" },
+    { file = "../tradingview/src/**/*.rs" },
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
