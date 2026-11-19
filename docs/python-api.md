@@ -262,8 +262,8 @@ Bars are de-duplicated by timestamp (the latest update wins) and sorted ascendin
 
 ### The last bar and dropped rows
 
-- **`HistoricalSeries.last_bar_complete`**: whether the newest bar had closed when the fetch finished, from the server's `lbs.bar_close_time` and the local clock; `None` when unknown. During a session the newest bar is usually still forming.
-- **`drop_incomplete_last_bar=True`** drops that bar when it had not closed, so training data never contains a partial bar.
+- **`HistoricalSeries.last_bar_complete`**: whether the newest bar had closed when the fetch finished: the server's clock (the timestamps on its messages, or the local clock when they are missing) had passed the server's `lbs.bar_close_time` plus the symbol's feed delay (`symbol_info.delay`, e.g. 900 s for HOSE) plus 2 s. `None` when unknown. During a session the newest bar is usually still forming.
+- **`drop_incomplete_last_bar=True`** drops that bar when it had not closed, so training data never contains a partial bar. With `max_bars`, one extra bar is fetched so exactly `max_bars` closed bars are returned.
 - **`HistoricalSeries.dropped_rows`**: bar rows the server sent that could not be parsed (malformed or without OHLC values). They are left out and logged as a warning.
 
 ```python

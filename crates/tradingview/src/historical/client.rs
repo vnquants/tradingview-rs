@@ -17,7 +17,7 @@ use crate::{
     },
     live::handler::{CommandTx, Handler, HandlerFactory},
     live::models::TradingViewDataEvent,
-    live::websocket::{ErrorRecoveryConfig, ShutdownGuard, WebSocketClient},
+    live::websocket::{ErrorRecoveryConfig, ShutdownGuard, WebSocketClient, validate_endpoint},
     utils::symbol_init,
 };
 
@@ -42,20 +42,13 @@ impl HistoricalClient {
         }
     }
 
-    /// Connect to `endpoint` (a `ws://` or `wss://` URL) instead of
+    /// Connect to `endpoint` instead of
     /// `wss://{server}.tradingview.com/socket.io/websocket`, for example a
-    /// proxy or a local test server. The auth token is sent to this endpoint.
+    /// proxy or a local test server. It must be a `wss://` URL, or `ws://` on a
+    /// loopback host; the auth token is sent to this endpoint.
     pub fn with_endpoint(mut self, endpoint: &str) -> Result<Self> {
         let url = Url::parse(endpoint)?;
-        if !matches!(url.scheme(), "ws" | "wss") {
-            return Err(Error::UrlParse(
-                format!(
-                    "endpoint must be a ws:// or wss:// URL, got {}",
-                    url.scheme()
-                )
-                .into(),
-            ));
-        }
+        validate_endpoint(&url)?;
         self.endpoint = Some(url);
         Ok(self)
     }
@@ -287,12 +280,22 @@ impl HistoricalConnection {
             );
         }
         let last_bar_close_time = guard.last_bar_close_time;
+        let now = guard
+            .server_now()
+            .unwrap_or_else(|| chrono::Utc::now().timestamp());
+        let feed_delay = i64::try_from(symbol_info.delay).unwrap_or(i64::MAX);
         let mut data = guard.finalize();
-        let now = chrono::Utc::now().timestamp();
-        let mut last_bar_complete = last_bar_completeness(&data, last_bar_close_time, now);
-        if request.drop_incomplete_last_bar && last_bar_complete == Some(false) {
-            data.pop();
-            last_bar_complete = data.last().map(|_| true);
+        let mut last_bar_complete =
+            last_bar_completeness(&data, last_bar_close_time, now, feed_delay);
+        if request.drop_incomplete_last_bar
+            && last_bar_complete == Some(false)
+            && let Some(dropped) = data.pop()
+        {
+            // The dropped bar's open is an upper bound for the previous
+            // bar's close: it proves completeness, never incompleteness.
+            last_bar_complete =
+                last_bar_completeness(&data, Some(dropped.timestamp()), now, feed_delay)
+                    .filter(|complete| *complete);
         }
         let data = trim_to_request(data, request.from_timestamp, request.max_bars);
         Ok(HistoricalResult {
@@ -390,7 +393,15 @@ impl HistoricalConnection {
                 .into(),
             ));
         }
-        take_error(state)?;
+        // A protocol error always fails the fetch; a closed connection only
+        // when the load had not completed (all bars arrived before the close).
+        let (errored, completed) = {
+            let guard = state.lock().unwrap();
+            (guard.errored, guard.completed)
+        };
+        if errored || !completed {
+            take_error(state)?;
+        }
 
         let Some(plan) = plan else {
             return Ok(None);
@@ -406,16 +417,28 @@ impl HistoricalConnection {
     }
 }
 
-/// Whether the last bar of `data` had closed at `now`, from the server's
-/// `lbs.bar_close_time`; `None` when there is no bar or no usable close time.
+/// Seconds after a bar's close (plus the feed delay) before it counts as
+/// complete, to absorb clock skew and in-flight updates.
+pub(crate) const LAST_BAR_MARGIN_SECS: i64 = 2;
+
+/// Whether the last bar of `data` had closed at `now` (Unix seconds, server
+/// clock when known), from the server's `lbs.bar_close_time`: a bar is closed
+/// once `now >= close_time + feed_delay + LAST_BAR_MARGIN_SECS`, because a
+/// delayed feed delivers the bar's last trades `feed_delay` seconds late.
+/// `None` when there is no bar or no usable close time.
 fn last_bar_completeness(
     data: &[DataPoint],
     last_bar_close_time: Option<i64>,
     now: i64,
+    feed_delay: i64,
 ) -> Option<bool> {
     let last_open = data.last()?.timestamp();
     let close_time = last_bar_close_time.filter(|close| *close > last_open)?;
-    Some(now >= close_time)
+    Some(
+        now >= close_time
+            .saturating_add(feed_delay)
+            .saturating_add(LAST_BAR_MARGIN_SECS),
+    )
 }
 
 /// Bars for the initial `create_series`: the requested `num_bars`, or with
@@ -866,6 +889,12 @@ impl Handler for SessionRouter {
             record_transport_error(&state, &error);
         }
     }
+
+    fn handle_server_time(&self, server_time_ms: u64) {
+        for state in self.all() {
+            state.lock().unwrap().record_server_time(server_time_ms);
+        }
+    }
 }
 
 // =============================================================================
@@ -892,6 +921,13 @@ impl Handler for HistoricalDataHandler {
     fn notify_error(&self, error: Error, _message: &[Value]) {
         warn!(?error, "Historical handler error");
         record_transport_error(&self.state, &error);
+    }
+
+    fn handle_server_time(&self, server_time_ms: u64) {
+        self.state
+            .lock()
+            .unwrap()
+            .record_server_time(server_time_ms);
     }
 }
 
@@ -1435,16 +1471,28 @@ mod tests {
                 value: vec![ts as f64, 1.0, 1.0, 1.0, 1.0, 1.0],
             })
             .collect();
-        // The newest bar opened at 4_600 and closes at 8_200.
+        // The newest bar opened at 4_600 and closes at 8_200; 2 s margin.
         assert_eq!(
-            last_bar_completeness(&data, Some(8_200), 8_199),
+            last_bar_completeness(&data, Some(8_200), 8_201, 0),
             Some(false)
         );
-        assert_eq!(last_bar_completeness(&data, Some(8_200), 8_200), Some(true));
-        assert_eq!(last_bar_completeness(&data, None, 9_000), None);
+        assert_eq!(
+            last_bar_completeness(&data, Some(8_200), 8_202, 0),
+            Some(true)
+        );
+        // A 900 s delayed feed delivers the bar's last trades 900 s late.
+        assert_eq!(
+            last_bar_completeness(&data, Some(8_200), 9_000, 900),
+            Some(false)
+        );
+        assert_eq!(
+            last_bar_completeness(&data, Some(8_200), 9_102, 900),
+            Some(true)
+        );
+        assert_eq!(last_bar_completeness(&data, None, 9_000, 0), None);
         // A close time that is not after the newest bar's open is unusable.
-        assert_eq!(last_bar_completeness(&data, Some(4_600), 9_000), None);
-        assert_eq!(last_bar_completeness(&[], Some(8_200), 9_000), None);
+        assert_eq!(last_bar_completeness(&data, Some(4_600), 9_000, 0), None);
+        assert_eq!(last_bar_completeness(&[], Some(8_200), 9_000, 0), None);
     }
 
     #[test]

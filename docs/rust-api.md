@@ -98,13 +98,47 @@ look like milliseconds and are rejected).
 
 Each result also carries `dropped_rows` (unparseable bar rows, logged as a
 warning), `last_bar_close_time` (the server's `lbs.bar_close_time`) and
-`last_bar_complete` (whether the newest bar had closed when the fetch
-finished); `.drop_incomplete_last_bar(true)` removes a still-forming newest bar.
+`last_bar_complete`: whether the newest bar had closed when the fetch finished,
+that is whether the server's clock (the `t` timestamps on its messages, or the
+local clock when they are missing) had passed `lbs.bar_close_time` plus the
+symbol's feed `delay` plus 2 s. `.drop_incomplete_last_bar(true)` removes a
+still-forming newest bar; with `max_bars`, pagination collects one extra bar so
+that exactly `max_bars` closed bars remain.
 
-`HistoricalClient::with_endpoint("ws://...")` points the client at another
-WebSocket URL, for example a proxy or a local test server
-(`crates/tradingview/tests/historical_mock.rs` runs the client against one).
-The auth token is sent to that endpoint.
+A completed load stays a success when the server closes the connection right
+after `series_completed`.
+
+`HistoricalClient::with_endpoint(url)` (and `WebSocketClient::builder().endpoint(url)`)
+points the client at another WebSocket URL, for example a proxy or a local test
+server (`crates/tradingview/tests/historical_mock.rs` runs the client against
+one). The URL must be `wss://`; `ws://` is accepted only for a loopback host
+(`localhost`, `127.0.0.0/8`, `::1`). The auth token is sent to that endpoint.
+
+### Logging
+
+The crate logs through `tracing`, and its packet logs redact `set_auth_token`.
+The WebSocket transport, `tungstenite`, logs raw frames at `TRACE` through the
+`log` crate, and the first frame carries the auth token. When `log` records
+reach your subscriber (for example via `tracing_subscriber::fmt().init()`),
+cap `tungstenite` and `tokio_tungstenite` at `DEBUG` by appending
+`tradingview::RECOMMENDED_LOG_DIRECTIVES` to your filter:
+
+```rust
+use tracing_subscriber::{filter::Targets, prelude::*};
+
+let filter: Targets = format!("trace,{}", tradingview::RECOMMENDED_LOG_DIRECTIVES).parse()?;
+tracing_subscriber::registry()
+    .with(tracing_subscriber::fmt::layer())
+    .with(filter)
+    .init();
+```
+
+With `EnvFilter`, use `RUST_LOG=trace,tungstenite=debug,tokio_tungstenite=debug`.
+`.cargo/config.toml` and `.env.example` set
+`RUST_LOG=debug,tungstenite=debug,tokio_tungstenite=debug`; the examples log at
+`INFO`. `crates/tradingview/tests/log_redaction.rs` checks the recommended
+filter and shows that uncapped `TRACE` does leak the token through
+`tungstenite`.
 
 ```rust
 use std::time::Duration;

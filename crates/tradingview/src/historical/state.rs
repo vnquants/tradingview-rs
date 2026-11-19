@@ -33,6 +33,9 @@ pub struct HistoricalState {
     pub disconnected: Option<String>,
     /// First TradingView protocol error (`symbol_error`, `series_error`, ...).
     pub protocol_error: Option<TradingViewError>,
+    /// Latest server timestamp (`t_ms`) seen on the connection and when it was
+    /// received, to judge bar completeness by the server's clock.
+    pub server_time: Option<(u64, Instant)>,
 }
 
 impl HistoricalState {
@@ -58,6 +61,7 @@ impl HistoricalState {
             last_bar_close_time: None,
             disconnected: None,
             protocol_error: None,
+            server_time: None,
         }
     }
     pub fn with_capacity(capacity: usize) -> Self {
@@ -98,6 +102,22 @@ impl HistoricalState {
             self.last_bar_close_time
                 .map_or(close_time, |known| known.max(close_time)),
         );
+    }
+    /// Remember the newest server timestamp (milliseconds) and when it arrived.
+    pub fn record_server_time(&mut self, server_time_ms: u64) {
+        if self
+            .server_time
+            .is_none_or(|(known, _)| server_time_ms >= known)
+        {
+            self.server_time = Some((server_time_ms, Instant::now()));
+        }
+    }
+    /// The server's current time in Unix seconds, extrapolated from the newest
+    /// server timestamp; `None` when no message carried one.
+    pub fn server_now(&self) -> Option<i64> {
+        let (server_ms, received) = self.server_time?;
+        let elapsed_ms = u64::try_from(received.elapsed().as_millis()).unwrap_or(u64::MAX);
+        i64::try_from(server_ms.saturating_add(elapsed_ms) / 1_000).ok()
     }
     /// Record that the connection closed and wake waiters. The first reason wins.
     pub fn disconnect(&mut self, reason: &str) {
@@ -236,6 +256,15 @@ mod tests {
         state.disconnect("later");
         assert_eq!(state.disconnected.as_deref(), Some("server closed"));
         assert!(state.is_done());
+    }
+
+    #[test]
+    fn test_server_now_extrapolates_newest_server_time() {
+        let mut state = HistoricalState::new();
+        assert_eq!(state.server_now(), None);
+        state.record_server_time(1_700_000_000_900);
+        state.record_server_time(1_600_000_000_000); // older: ignored
+        assert_eq!(state.server_now(), Some(1_700_000_000));
     }
 
     #[test]

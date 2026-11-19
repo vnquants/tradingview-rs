@@ -14,13 +14,19 @@
 //! | `DROPPAGE` | drops the TCP connection on `request_more_data` |
 //! | `LATEPAGE` | answers `request_more_data` 2.6 s late |
 //! | `DIEAFTER` / `CLOSEAFTER` | drops the connection / sends a close frame on `chart_delete_session` |
+//! | `DONECLOSE` / `DONEDROP` | completes the initial load, then sends a close frame / drops the connection |
+//! | `FLAKY` | drops the connection on the first `create_series` for that name, then works |
+//! | `FORMING` | newest bar closes 30 min from now (`lbs.bar_close_time`) |
+//! | `DELAYED` | `delay: 900`; newest bar's nominal close was 60 s ago |
+//! | `SKEWAHEAD` | messages carry server time `t`/`t_ms` 60 s behind the local clock; the bar closes 5 s after server now |
+//! | `SKEWBEHIND` | server time 60 s ahead of the local clock; the bar closed 10 s before server now |
 //!
 //! Bars are hourly; every bar of a symbol has the same close, derived from
 //! the symbol name, so mixed-up results are detectable.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
@@ -62,6 +68,40 @@ fn parse_frames(text: &str) -> Vec<Value> {
     out
 }
 
+fn local_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+}
+
+/// Offset of the mock's server clock from the local clock, in seconds.
+fn server_skew(name: &str) -> Option<i64> {
+    if name.starts_with("SKEWAHEAD") {
+        Some(-60) // the local clock is 60 s ahead of the server
+    } else if name.starts_with("SKEWBEHIND") {
+        Some(60) // the local clock is 60 s behind the server
+    } else {
+        None
+    }
+}
+
+/// `lbs.bar_close_time` of the newest bar for symbols that send one.
+fn last_bar_close_time(name: &str) -> Option<i64> {
+    let server_now = local_now() + server_skew(name).unwrap_or(0);
+    if name.starts_with("FORMING") {
+        Some(server_now + 1800)
+    } else if name.starts_with("DELAYED") {
+        Some(server_now - 60)
+    } else if name.starts_with("SKEWAHEAD") {
+        Some(server_now + 5)
+    } else if name.starts_with("SKEWBEHIND") {
+        Some(server_now - 10)
+    } else {
+        None
+    }
+}
+
 /// `count` hourly bars with indices `from_index..from_index + count`; index 0
 /// is the newest bar of the initial load.
 fn bars(name: &str, from_index: i64, count: i64) -> Value {
@@ -72,7 +112,21 @@ fn bars(name: &str, from_index: i64, count: i64) -> Value {
             json!({"i": i, "v": [ts as f64, c, c + 1.0, c - 1.0, c, 10.0]})
         })
         .collect();
-    json!({"sds_1": {"s": rows, "ns": {"d": "", "indexes": []}, "t": "s1"}})
+    let mut series = json!({"s": rows, "ns": {"d": "", "indexes": []}, "t": "s1"});
+    if let Some(close) = last_bar_close_time(name) {
+        series["lbs"] = json!({"bar_close_time": close});
+    }
+    json!({"sds_1": series})
+}
+
+/// Add the server timestamps `t`/`t_ms` for symbols with a skewed server clock.
+fn stamp(name: &str, mut message: Value) -> Value {
+    if let Some(skew) = server_skew(name) {
+        let server_ms = (local_now() + skew) * 1000;
+        message["t"] = json!(server_ms / 1000);
+        message["t_ms"] = json!(server_ms);
+    }
+    message
 }
 
 struct Session {
@@ -85,6 +139,8 @@ struct Counters {
     connections: AtomicUsize,
     open_now: AtomicUsize,
     max_open: AtomicUsize,
+    /// `create_series` calls per symbol name.
+    attempts: Mutex<HashMap<String, usize>>,
 }
 
 struct MockServer {
@@ -130,12 +186,15 @@ async fn serve(stream: tokio::net::TcpStream, counters: Arc<Counters>) {
     let open = counters.open_now.fetch_add(1, Ordering::SeqCst) + 1;
     counters.max_open.fetch_max(open, Ordering::SeqCst);
     if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
-        session_loop(ws).await;
+        session_loop(ws, &counters).await;
     }
     counters.open_now.fetch_sub(1, Ordering::SeqCst);
 }
 
-async fn session_loop(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
+async fn session_loop(
+    ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+    counters: &Counters,
+) {
     let (mut tx, mut rx) = ws.split();
     let mut sessions: HashMap<String, Session> = HashMap::new();
     let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
@@ -152,6 +211,8 @@ async fn session_loop(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStre
                     let p = packet["p"].as_array().cloned().unwrap_or_default();
                     let cs = p.first().and_then(Value::as_str).unwrap_or_default().to_string();
                     let mut replies = Vec::new();
+                    let mut then_close = false;
+                    let mut then_drop = false;
                     match m.as_str() {
                         "resolve_symbol" => {
                             let raw = p[2].as_str().unwrap().trim_start_matches('=');
@@ -164,7 +225,8 @@ async fn session_loop(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStre
                             } else {
                                 json!({"m": "symbol_resolved", "p": [cs, p[1], {
                                     "pro_name": full, "name": name, "exchange": exchange,
-                                    "pricescale": 100, "minmov": 1
+                                    "pricescale": 100, "minmov": 1,
+                                    "delay": if name.starts_with("DELAYED") { 900 } else { 0 }
                                 }]})
                             });
                         }
@@ -180,6 +242,17 @@ async fn session_loop(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStre
                                 let _ = tx.send(Message::Close(None)).await;
                                 break 'conn;
                             }
+                            let attempt = {
+                                let mut attempts = counters.attempts.lock().unwrap();
+                                let n = attempts.entry(name.clone()).or_insert(0);
+                                *n += 1;
+                                *n
+                            };
+                            if name.starts_with("FLAKY") && attempt == 1 {
+                                break 'conn;
+                            }
+                            then_close = name.starts_with("DONECLOSE");
+                            then_drop = name.starts_with("DONEDROP");
                             let count = p[5].as_i64().unwrap();
                             sessions.get_mut(&cs).unwrap().earliest = -(count - 1);
                             replies.extend([
@@ -230,10 +303,18 @@ async fn session_loop(ws: tokio_tungstenite::WebSocketStream<tokio::net::TcpStre
                         }
                         _ => {}
                     }
-                    for reply in &replies {
-                        if tx.send(frame(reply)).await.is_err() {
+                    let name = sessions.get(&cs).map(|s| s.name.clone()).unwrap_or_default();
+                    for reply in replies {
+                        if tx.send(frame(&stamp(&name, reply))).await.is_err() {
                             break 'conn;
                         }
+                    }
+                    if then_close {
+                        let _ = tx.send(Message::Close(None)).await;
+                        break 'conn;
+                    }
+                    if then_drop {
+                        break 'conn;
                     }
                 }
             }
@@ -522,9 +603,135 @@ async fn handshake_that_never_answers_is_bounded_by_the_timeout() {
 }
 
 #[test]
-fn with_endpoint_requires_a_websocket_url() {
-    let client = HistoricalClient::new("t", DataServer::Data);
-    assert!(client.with_endpoint("https://example.com/socket").is_err());
-    let client = HistoricalClient::new("t", DataServer::Data);
-    assert!(client.with_endpoint("not a url").is_err());
+fn with_endpoint_requires_tls_except_on_loopback() {
+    let client = || HistoricalClient::new("t", DataServer::Data);
+    assert!(
+        client()
+            .with_endpoint("https://example.com/socket")
+            .is_err()
+    );
+    assert!(client().with_endpoint("not a url").is_err());
+    assert!(
+        client()
+            .with_endpoint("ws://proxy.example.com/socket")
+            .is_err()
+    );
+    assert!(
+        client()
+            .with_endpoint("ws://192.168.1.10:9000/socket")
+            .is_err()
+    );
+    assert!(
+        client()
+            .with_endpoint("wss://proxy.example.com/socket")
+            .is_ok()
+    );
+    assert!(client().with_endpoint("ws://127.0.0.1:9000/socket").is_ok());
+    assert!(client().with_endpoint("ws://localhost:9000/socket").is_ok());
+    assert!(client().with_endpoint("ws://[::1]:9000/socket").is_ok());
+}
+
+fn single(name: &str) -> HistoricalRequest {
+    HistoricalRequest::builder()
+        .symbol(name.to_string())
+        .exchange("MOCK".to_string())
+        .interval(Interval::OneHour)
+        .num_bars(10)
+        .timeout(Duration::from_secs(5))
+        .build()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn completed_load_survives_a_close_right_after_series_completed() {
+    for kind in ["DONECLOSE", "DONEDROP"] {
+        let server = MockServer::start().await;
+        for run in 0..40 {
+            let result = server
+                .client()
+                .retrieve(single(&format!("{kind}{run}")))
+                .await;
+            let result =
+                result.unwrap_or_else(|e| panic!("{kind} run {run}: all bars arrived, got {e}"));
+            assert_eq!(result.len(), 10, "{kind} run {run}");
+            assert!(result.is_complete());
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flaky_symbol_succeeds_on_the_retry() {
+    let server = MockServer::start().await;
+    let (batch, _) = run_batch(&server, &["FLAKY1", "G1"], 1, 2000, 0).await;
+    assert_ok(&batch, "FLAKY1");
+    assert_ok(&batch, "G1");
+    // The dropped first connection, then one connection for the retry and G1.
+    assert_eq!(server.connections(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drop_incomplete_last_bar_with_max_bars_returns_max_bars_closed_bars() {
+    let server = MockServer::start().await;
+    for max_bars in [25u64, 30] {
+        let request = HistoricalRequest::builder()
+            .symbol("FORMING".to_string())
+            .exchange("MOCK".to_string())
+            .interval(Interval::OneHour)
+            .num_bars(10)
+            .max_bars(max_bars)
+            .page_size(10)
+            .page_delay(Duration::ZERO)
+            .drop_incomplete_last_bar(true)
+            .timeout(Duration::from_secs(5))
+            .build();
+        let result = server.client().retrieve(request).await.unwrap();
+        assert_eq!(result.len() as u64, max_bars);
+        assert_eq!(result.pagination_stop, Some(PaginationStop::ReachedMaxBars));
+        assert!(result.is_complete());
+        assert_eq!(result.last_bar_complete, Some(true));
+        // The forming bar (index 0, ts 1_700_000_000) is gone.
+        assert_eq!(result.last_timestamp(), Some(1_700_000_000 - 3600));
+    }
+    let kept = server.client().retrieve(single("FORMING")).await.unwrap();
+    assert_eq!(kept.len(), 10);
+    assert_eq!(kept.last_bar_complete, Some(false));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn last_bar_complete_accounts_for_the_feed_delay() {
+    let server = MockServer::start().await;
+    // Nominal close 60 s ago, but the feed is 900 s delayed: still forming.
+    let delayed = server.client().retrieve(single("DELAYED")).await.unwrap();
+    assert_eq!(delayed.symbol_info.delay, 900);
+    assert_eq!(delayed.last_bar_complete, Some(false));
+    let mut request = single("DELAYED");
+    request.drop_incomplete_last_bar = true;
+    let dropped = server.client().retrieve(request).await.unwrap();
+    assert_eq!(dropped.len(), 9);
+    assert_eq!(dropped.last_bar_complete, Some(true));
+    // No lbs at all: unknown.
+    let plain = server.client().retrieve(single("PLAIN")).await.unwrap();
+    assert_eq!(plain.last_bar_complete, None);
+    assert_eq!(plain.last_bar_close_time, None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn last_bar_complete_uses_the_server_clock_not_the_local_clock() {
+    let server = MockServer::start().await;
+    // Local clock 60 s ahead: by the local clock the bar closed 55 s ago, but
+    // by the server clock it closes in 5 s.
+    let ahead = server.client().retrieve(single("SKEWAHEAD")).await.unwrap();
+    assert_eq!(ahead.last_bar_complete, Some(false));
+    // Local clock 60 s behind: by the local clock the bar closes in 50 s, but
+    // by the server clock it closed 10 s ago.
+    let behind = server
+        .client()
+        .retrieve(single("SKEWBEHIND"))
+        .await
+        .unwrap();
+    assert_eq!(behind.last_bar_complete, Some(true));
+
+    let mut request = single("SKEWAHEAD");
+    request.drop_incomplete_last_bar = true;
+    let dropped = server.client().retrieve(request).await.unwrap();
+    assert_eq!(dropped.len(), 9);
 }

@@ -226,7 +226,8 @@ class HistoricalSeries:
     dropped_rows: int
     """Bar rows the server sent that could not be parsed and were dropped."""
     last_bar_complete: bool | None
-    """Whether the last bar had closed when the fetch finished (local clock); None when unknown."""
+    """Whether the last bar had closed when the fetch finished, by the server's clock
+    and including the feed delay (`symbol_info.delay`) plus 2 s; None when unknown."""
 
     def __init__(
         self,
@@ -519,7 +520,9 @@ class TradingViewClient:
             allow_partial: Return the bars received so far, instead of raising,
                 when a page times out or the connection closes during pagination;
                 with `as_dataframe=True`, also return incomplete histories.
-            drop_incomplete_last_bar: Drop the newest bar if it had not closed yet.
+            drop_incomplete_last_bar: Drop the newest bar if it had not closed yet (see
+                `HistoricalSeries.last_bar_complete`); with `max_bars`, exactly
+                `max_bars` closed bars are returned.
 
         Pagination stops at `from_timestamp` or `max_bars`, when the server reports
         the start of history or its bar limit, when a page adds no older bar, or

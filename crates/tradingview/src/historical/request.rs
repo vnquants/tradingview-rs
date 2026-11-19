@@ -135,8 +135,12 @@ pub struct HistoricalRequest {
     /// times out or the connection closes during pagination.
     #[builder(default = false)]
     pub allow_partial: bool,
-    /// Drop the newest bar when it had not closed yet when the fetch finished
-    /// (judged from the server's `lbs.bar_close_time` and the local clock).
+    /// Drop the newest bar when it had not closed yet when the fetch finished.
+    /// The bar counts as closed once the server's clock (the `t` timestamps of
+    /// its messages, or the local clock when they are missing) passes
+    /// `lbs.bar_close_time` plus the symbol's feed `delay` plus 2 s. With
+    /// `max_bars`, pagination collects one extra bar so that `max_bars`
+    /// closed bars remain.
     #[builder(default = false)]
     pub drop_incomplete_last_bar: bool,
 }
@@ -149,7 +153,8 @@ pub const MAX_FROM_TIMESTAMP: i64 = 100_000_000_000;
 pub struct PaginationPlan {
     /// Stop once the oldest bar is at or before this Unix time.
     pub from_timestamp: Option<i64>,
-    /// Stop once this many distinct bars were received.
+    /// Stop once this many distinct bars were received: `max_bars`, plus one
+    /// with `drop_incomplete_last_bar`, so that many closed bars remain.
     pub max_bars: Option<u64>,
     /// Maximum number of `request_more_data` pages.
     pub max_pages: u32,
@@ -212,7 +217,13 @@ impl HistoricalRequest {
     pub fn pagination_plan(&self) -> Option<PaginationPlan> {
         self.paginates().then(|| PaginationPlan {
             from_timestamp: self.from_timestamp,
-            max_bars: self.max_bars,
+            max_bars: self.max_bars.map(|max_bars| {
+                if self.drop_incomplete_last_bar {
+                    max_bars.saturating_add(1)
+                } else {
+                    max_bars
+                }
+            }),
             max_pages: self.max_pages.unwrap_or(DEFAULT_MAX_PAGES),
             page_size: self.page_size.max(1),
             page_delay: self.page_delay,
@@ -308,6 +319,24 @@ mod tests {
 
         let missing = HistoricalRequest::builder().build().validate();
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn test_drop_incomplete_last_bar_collects_one_extra_bar() {
+        let base = || {
+            HistoricalRequest::builder()
+                .symbol("BTCUSDT".to_string())
+                .exchange("BINANCE".to_string())
+                .max_bars(30)
+        };
+        assert_eq!(base().build().pagination_plan().unwrap().max_bars, Some(30));
+        let dropping = base().drop_incomplete_last_bar(true).build();
+        assert_eq!(dropping.pagination_plan().unwrap().max_bars, Some(31));
+        assert_eq!(
+            dropping.max_bars,
+            Some(30),
+            "the result is still trimmed to 30"
+        );
     }
 
     #[test]
