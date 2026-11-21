@@ -37,6 +37,11 @@ pub trait Handler: Send + Sync + 'static {
 
     /// Called when an error occurs in the WebSocket or command pipeline.
     fn notify_error(&self, error: Error, message: &[Value]);
+
+    /// Called before [`Self::handle_events`] with the server's timestamp of the
+    /// message in milliseconds (`t_ms`, or `t` in seconds), when it carries
+    /// one. The default ignores it.
+    fn handle_server_time(&self, _server_time_ms: u64) {}
 }
 
 /// Factory trait for constructing [`Handler`] implementations.

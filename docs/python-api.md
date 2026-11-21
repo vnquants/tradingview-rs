@@ -23,6 +23,8 @@ from tradingview import (
     Interval,
     FinancialPeriod,
     EconomicImportance,
+    MarketAdjustment,
+    SessionType,
 )
 ```
 
@@ -193,16 +195,30 @@ async def get_historical(
     symbol: str,
     exchange: str,
     interval: Interval = Interval.OneDay,
-    n_bars: int = 100,
+    n_bars: int | None = None,
     with_replay: bool = False,
     as_dataframe: bool = False,
     *,
     server: DataServer | None = None,
+    from_timestamp: int | None = None,
+    max_bars: int | None = None,
+    max_pages: int | None = None,
+    page_size: int = 5000,
+    page_delay: float = 0.5,
+    adjustment: MarketAdjustment | None = None,
+    session_type: SessionType | None = None,
+    currency: str | None = None,
+    allow_partial: bool = False,
+    drop_incomplete_last_bar: bool = False,
 ) -> HistoricalSeries | polars.DataFrame: ...
 ```
 
 - **`as_dataframe=True`**: Directly returns a `polars.DataFrame` with columns `["timestamp", "open", "high", "low", "close", "volume"]`.
 - **`as_dataframe=False`**: Returns a `HistoricalSeries` container.
+- **`n_bars`**: Bars in the first request. Without pagination it defaults to 100, as before. With pagination it defaults to `page_size` (capped at `max_bars`).
+- **`with_replay`**: Has no effect; kept for compatibility. Use the pagination keywords to load older bars.
+- All keywords after `*` are keyword-only, and their defaults keep the previous behaviour: one request, no adjustment, session or currency key sent.
+- **Validation at call time**: invalid keywords raise `ValueError` when the method is called, before the coroutine is returned or awaited: a non-positive `n_bars`, `max_bars` or `page_size`, a negative `max_pages` or `page_delay`, an unknown `currency`, or a `from_timestamp` in the future or above 10^11 (which looks like milliseconds; pass Unix seconds).
 
 ```python
 # Direct Polars DataFrame
@@ -218,7 +234,88 @@ first = series[0]           # First Bar
 last = series[-1]           # Negative indexing supported
 df_pl = series.to_polars()  # Convert to Polars DataFrame
 df_pd = series.to_pandas()  # Convert to Pandas DataFrame
+print(series.symbol_info)   # SymbolInfo(id='NASDAQ:AAPL', ..., tick_size=0.01)
 ```
+
+### Pagination (`from_timestamp`, `max_bars`, `max_pages`)
+
+Setting `from_timestamp`, `max_bars` or `max_pages` makes the client page back with TradingView's `request_more_data` after the first request: `page_size` older bars per page, waiting `page_delay` seconds before each page. It stops at the first of:
+
+| `pagination_stop` | Condition |
+| --- | --- |
+| `"reached_from"` | The oldest bar is at or before `from_timestamp` (Unix seconds). |
+| `"reached_max_bars"` | At least `max_bars` distinct bars were received. |
+| `"end_of_history"` | The server reports the start of the symbol's history. |
+| `"bar_limit"` | The server reports the bar limit of the data server. |
+| `"no_more_data"` | A page added no older bar. |
+| `"max_pages"` | `max_pages` pages were sent (default 100 when another keyword enabled pagination). |
+| `"timeout"` | Only with `allow_partial=True`: a page did not complete within 30 seconds. |
+| `"connection_closed"` | Only with `allow_partial=True`: the connection closed during pagination. |
+
+Bars are de-duplicated by timestamp (the latest update wins) and sorted ascending. Bars older than `from_timestamp` are dropped, and with `max_bars` only the newest `max_bars` are returned. `HistoricalSeries.pages_fetched` and `HistoricalSeries.pagination_stop` report what happened. The `PaginationStop` type alias lists the values.
+
+**Truncated history is never a silent success.**
+
+- A page that times out raises `TimeoutError`, and a connection that closes raises `ConnectionError`, as soon as the closure is noticed (no waiting for the timeout). Pass `allow_partial=True` to get the bars received so far instead, with `pagination_stop` `"timeout"` or `"connection_closed"`.
+- `HistoricalSeries.is_complete` is `True` without pagination, or when pagination stopped at `"reached_from"`, `"reached_max_bars"` or `"end_of_history"`. After `"bar_limit"`, `"max_pages"`, `"no_more_data"`, `"timeout"` or `"connection_closed"`, older bars may exist and it is `False`.
+- A Polars DataFrame cannot carry the stop reason, so the DataFrame path (`as_dataframe=True` or `get_historical_df`) raises `IncompleteHistoryError` (a `TradingViewError`) when `is_complete` would be `False`, unless `allow_partial=True`. For example, `from_timestamp` far beyond the data server's bar limit raises with `bar_limit` in the message.
+
+### The last bar and dropped rows
+
+- **`HistoricalSeries.last_bar_complete`**: whether the newest bar had closed when the fetch finished: the server's clock (the timestamps on its messages, or the local clock when they are missing) had passed the server's `lbs.bar_close_time` plus the symbol's feed delay (`symbol_info.delay`, e.g. 900 s for HOSE) plus 2 s. `None` when unknown. During a session the newest bar is usually still forming.
+- **`drop_incomplete_last_bar=True`** drops that bar when it had not closed, so training data never contains a partial bar. With `max_bars`, one extra bar is fetched so exactly `max_bars` closed bars are returned; when `max_bars` is a multiple of `page_size` that costs one more page. If `max_pages` or the bar limit ends the walk with exactly `max_bars` closed bars, `pagination_stop` is still `"reached_max_bars"`.
+- **`HistoricalSeries.dropped_rows`**: bar rows the server sent that could not be parsed (malformed or without OHLC values). They are left out and logged as a warning.
+
+```python
+import datetime as dt
+
+start = int(dt.datetime(2025, 1, 1, tzinfo=dt.timezone.utc).timestamp())
+series = await client.get_historical(
+    "VCB", "HOSE", Interval.OneHour,
+    from_timestamp=start,
+    page_delay=1.0,
+    server=DataServer.ProData,
+)
+print(len(series), series.pages_fetched, series.pagination_stop)
+```
+
+> **History depth is capped by the data server.** Pagination cannot go past the server's bar limit: the server answers with `data_completed: "limit"` (`pagination_stop == "bar_limit"`). On 2026-11-19, `DataServer.Data`, `WidgetData` and `MobileData` returned about 5,000-8,000 bars and `DataServer.ProData` about 10,000-16,500 (a cap of about 5,000 or 10,000 bars, extended to TradingView's internal block boundary), with the same result anonymously and with a token session. A single request with a large `n_bars` reaches the same depth. See [`docs/history-depth.md`](history-depth.md) for the measured table (for example, 1-minute BINANCE:BTCUSDT reaches back about 4 days on `Data` and 11 days on `ProData`).
+
+### Adjustment, session and currency
+
+- **`adjustment`**: `MarketAdjustment.Splits` (split and stock-dividend adjusted; the server default), `MarketAdjustment.Dividends` (also back-adjusted for cash dividends) or `MarketAdjustment.Unadjusted` (raw traded prices, wire value `"none"`). Symbols that do not support adjustment, such as crypto pairs, return the same bars for every value.
+- **`session_type`**: `SessionType.Regular` (server default), `Extended` (regular plus pre- and post-market), `PreMarket` or `PostMarket`. Only symbols with extended hours (for example US stocks) differ.
+- **`currency`**: ISO 4217 code such as `"USD"` to convert prices; `symbol_info.currency_code` reflects the conversion. An unknown code raises `ValueError`.
+
+```python
+raw = await client.get_historical(
+    "VCB", "HOSE", Interval.OneDay, n_bars=1000,
+    adjustment=MarketAdjustment.Unadjusted,
+)
+aapl_ext = await client.get_historical(
+    "AAPL", "NASDAQ", Interval.OneHour, n_bars=500,
+    session_type=SessionType.Extended,
+)
+vcb_usd = await client.get_historical("VCB", "HOSE", Interval.OneDay, currency="USD")
+```
+
+### `SymbolInfo`
+
+`HistoricalSeries.symbol_info` holds the metadata TradingView sends with the bars:
+
+| Attribute | Example (HOSE:VCB) | Meaning |
+| --- | --- | --- |
+| `id`, `name`, `exchange`, `listed_exchange`, `description` | `"HOSE:VCB"`, `"VCB"`, `"HOSE"` | Identity |
+| `market_type` | `"stock"` | TradingView instrument type |
+| `currency_code` | `"VND"` | Price currency |
+| `timezone`, `session` | `"Asia/Ho_Chi_Minh"`, `"0900-1500"` | Exchange time zone and session |
+| `pricescale`, `minmov`, `minmove2` | `1`, `100`, `0` | Prices move in steps of `minmov / pricescale` |
+| `variable_tick_size` | `"10 10000 50 50000 100"` | Tick 10 below 10,000, 50 below 50,000, 100 above; empty when constant |
+| `pointvalue` | `1.0` | Value of a one-point move per contract |
+| `delay` | `900` | Data delay in seconds |
+| `isin` | `"VN000000VCB4"` | ISIN when known |
+| `tick_size` (property) | `100.0` | `minmov / pricescale`, or `None` when unknown |
+| `tick_size_at(price)` | `tick_size_at(9_990) == 10.0` | Tick at a price level, using `variable_tick_size` |
 
 ### `get_historical_batch`
 
@@ -226,17 +323,36 @@ df_pd = series.to_pandas()  # Convert to Pandas DataFrame
 async def get_historical_batch(
     symbols: Sequence[tuple[str, str]],
     interval: Interval = Interval.OneDay,
-    n_bars: int = 100,
+    n_bars: int | None = None,
     max_concurrency: int = 4,
     as_dataframe: bool = False,
     *,
     server: DataServer | None = None,
-) -> dict[str, HistoricalSeries] | dict[str, polars.DataFrame]: ...
+    from_timestamp: int | None = None,
+    max_bars: int | None = None,
+    max_pages: int | None = None,
+    page_size: int = 5000,
+    page_delay: float = 0.5,
+    adjustment: MarketAdjustment | None = None,
+    session_type: SessionType | None = None,
+    currency: str | None = None,
+    allow_partial: bool = False,
+    drop_incomplete_last_bar: bool = False,
+) -> HistoricalBatch: ...
 ```
 
-- Retrieves bars concurrently for multiple instruments with a bounded concurrency semaphore.
-- Results are keyed by `"EXCHANGE:SYMBOL"` (e.g. `"NASDAQ:AAPL"`, `"NASDAQ:MSFT"`).
+- Takes the keywords of `get_historical` and applies them to every symbol.
+- Opens at most `max_concurrency` WebSocket connections (never more than there are symbols). Each connection fetches its share of the symbols one after another, each in its own chart session. A connection is replaced after a connection failure or a timeout, and a symbol whose connection closed or could not be opened is retried once on a new connection.
+- Returns a `HistoricalBatch`: a `dict` keyed by `"EXCHANGE:SYMBOL"` (e.g. `"NASDAQ:AAPL"`) whose `failed` attribute maps every symbol left out to its error message, such as `"SymbolNotFoundError: Symbol resolution failed"` or `"TimeoutError: ..."`. With `as_dataframe=True` and without `allow_partial`, incomplete histories are listed in `failed` too.
 - When `as_dataframe=True`, values are `polars.DataFrame` instances.
+
+```python
+batch = await client.get_historical_batch([("AAPL", "NASDAQ"), ("NOPE", "NASDAQ")])
+for key, series in batch.items():
+    print(key, len(series), series.is_complete)
+for key, error in batch.failed.items():
+    print("failed:", key, error)
+```
 
 ---
 

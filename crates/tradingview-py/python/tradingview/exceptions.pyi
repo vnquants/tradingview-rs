@@ -21,9 +21,19 @@ class RateLimitError(TradingViewError):
 class ProtocolError(TradingViewError):
     """Raised when unexpected or unparseable frames are received from upstream."""
 
+class IncompleteHistoryError(TradingViewError):
+    """Raised when a DataFrame result would hide an incomplete history.
+
+    A Polars DataFrame cannot carry `pagination_stop`, so `get_historical(...,
+    as_dataframe=True)` and `get_historical_df` raise this when pagination stopped
+    before `from_timestamp`, `max_bars` or the start of history was reached (for
+    example at the data server's bar limit), unless `allow_partial=True`.
+    """
+
 __all__ = [
     "AuthenticationError",
     "ConnectionError",
+    "IncompleteHistoryError",
     "ProtocolError",
     "RateLimitError",
     "SymbolNotFoundError",

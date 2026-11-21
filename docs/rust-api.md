@@ -71,6 +71,128 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+### Pagination, adjustment, session and currency
+
+`HistoricalRequest` pages back with `request_more_data` when `from_timestamp`,
+`max_bars` or `max_pages` is set. `page_size` (default 5,000 bars) and
+`page_delay` (default 500 ms) shape each page; `timeout` applies to the initial
+load and to each page. `HistoricalResult::pages_fetched` and
+`HistoricalResult::pagination_stop` (`PaginationStop::{ReachedFrom,
+ReachedMaxBars, MaxPages, EndOfHistory, BarLimit, NoMoreData, Timeout,
+ConnectionClosed}`, `#[non_exhaustive]`) report the walk, and
+`HistoricalResult::is_complete()` is `true` only without pagination or after
+`ReachedFrom`, `ReachedMaxBars` or `EndOfHistory`. The data server's bar limit
+caps the depth (see [`history-depth.md`](history-depth.md)).
+
+Truncation is an error by default: an initial or page timeout returns
+`Error::Timeout`, and a closed connection returns `Error::WebSocket` as soon as
+the reader notices it (no waiting for the timeout). With
+`.allow_partial(true)`, a page timeout or closed connection during pagination
+returns the bars received so far with `PaginationStop::Timeout` or
+`PaginationStop::ConnectionClosed`. Connecting, including the WebSocket
+handshake, is bounded by `timeout` too.
+
+`retrieve` validates the request first: symbol and exchange are required and
+`from_timestamp` must be Unix seconds no later than now (values above 10^11
+look like milliseconds and are rejected).
+
+Each result also carries `dropped_rows` (unparseable bar rows, logged as a
+warning), `last_bar_close_time` (the server's `lbs.bar_close_time`) and
+`last_bar_complete`: whether the newest bar had closed when the fetch finished,
+that is whether the server's clock (the `t` timestamps on its messages, or the
+local clock when they are missing) had passed `lbs.bar_close_time` plus the
+symbol's feed `delay` plus 2 s. `.drop_incomplete_last_bar(true)` removes a
+still-forming newest bar; with `max_bars`, pagination collects one extra bar so
+that exactly `max_bars` closed bars remain (one more page when `max_bars` is a
+multiple of the page size). A walk that another condition ends with exactly
+`max_bars` closed bars still reports `ReachedMaxBars`.
+
+A completed load stays a success when the server closes the connection right
+after `series_completed`.
+
+`HistoricalClient::with_endpoint(url)` (and `WebSocketClient::builder().endpoint(url)`)
+points the client at another WebSocket URL, for example a proxy or a local test
+server (`crates/tradingview/tests/historical_mock.rs` runs the client against
+one). The URL must be `wss://`; `ws://` is accepted only for a loopback host
+(`localhost`, `127.0.0.0/8`, `::1`). The auth token is sent to that endpoint.
+
+### Logging
+
+The crate logs through `tracing`, and its packet logs redact `set_auth_token`.
+The WebSocket transport, `tungstenite`, logs raw frames at `TRACE` through the
+`log` crate, and the first frame carries the auth token. When `log` records
+reach your subscriber (for example via `tracing_subscriber::fmt().init()`),
+cap `tungstenite` and `tokio_tungstenite` at `DEBUG` by appending
+`tradingview::RECOMMENDED_LOG_DIRECTIVES` to your filter:
+
+```rust
+use tracing_subscriber::{filter::Targets, prelude::*};
+
+let filter: Targets = format!("trace,{}", tradingview::RECOMMENDED_LOG_DIRECTIVES).parse()?;
+tracing_subscriber::registry()
+    .with(tracing_subscriber::fmt::layer())
+    .with(filter)
+    .init();
+```
+
+With `EnvFilter`, use `RUST_LOG=trace,tungstenite=debug,tokio_tungstenite=debug`.
+`.cargo/config.toml` and `.env.example` set
+`RUST_LOG=debug,tungstenite=debug,tokio_tungstenite=debug`; the examples log at
+`INFO`. `crates/tradingview/tests/log_redaction.rs` checks the recommended
+filter and shows that uncapped `TRACE` does leak the token through
+`tungstenite`.
+
+```rust
+use std::time::Duration;
+use tradingview::historical::{BatchConfig, HistoricalClient, HistoricalRequest};
+use tradingview::{Currency, DataServer, Interval, MarketAdjustment, SessionType};
+
+# async fn run() -> tradingview::Result<()> {
+let client = HistoricalClient::new("unauthorized_user_token", DataServer::ProData);
+let request = HistoricalRequest::builder()
+    .symbol("VCB".to_string())
+    .exchange("HOSE".to_string())
+    .interval(Interval::OneHour)
+    .from_timestamp(1_735_689_600) // 2025-01-01T00:00:00Z
+    .page_delay(Duration::from_secs(1))
+    .adjustment(MarketAdjustment::Unadjusted) // Splits is the server default
+    .session_type(SessionType::Regular)
+    .currency(Currency::USD)
+    .build();
+let result = client.retrieve(request).await?;
+println!(
+    "{} bars, {} pages, stop={:?}, tick={:?}",
+    result.len(),
+    result.pages_fetched,
+    result.pagination_stop,
+    result.symbol_info.tick_size(),
+);
+
+// The same options for many symbols: at most `max_concurrency` connections,
+// each fetching its share of the symbols in turn; a symbol whose connection
+// failed is retried once on a new connection.
+let symbols = vec![("BTCUSDT".to_string(), "BINANCE".to_string())];
+let template = HistoricalRequest::builder()
+    .interval(Interval::OneMinute)
+    .max_bars(10_000)
+    .build();
+let batch = client
+    .retrieve_batch_with(&symbols, &template, BatchConfig::default())
+    .await;
+# Ok(())
+# }
+```
+
+`SymbolInfo` now keeps `session`, `pricescale`, `minmov`, `minmove2`,
+`variable_tick_size`, `pointvalue`, `delay` and `isin` from `symbol_resolved`
+(`timezone` was already kept). `SymbolInfo::tick_size()` returns
+`minmov / pricescale`, and `SymbolInfo::tick_size_at(price)` applies
+`variable_tick_size` (for HOSE:VCB, `"10 10000 50 50000 100"`: tick 10 below
+10,000, 50 below 50,000, 100 above).
+
+`ChartOptions` accepts `.`, `!`, `_`, `-` and `&` in exchange and symbol names,
+so `OKX:BTCUSDT.P`, `HNX:VN30F1!`, `FX_IDC:USDVND` and `NSE:M&M` validate.
+
 ---
 
 ## WebSocket & Quote Streaming
