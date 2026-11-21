@@ -1,15 +1,19 @@
 //! Batch historical data retrieval — concurrent multi-symbol fetching.
 //!
-//! Uses [`tokio::task::JoinSet`] to run [`HistoricalClient::retrieve`]
-//! concurrently for multiple symbols, with a semaphore for concurrency
-//! control to avoid overwhelming the TradingView data server.
+//! Up to `max_concurrency` workers each open one WebSocket connection and
+//! fetch their share of the symbols one after another, every symbol in its own
+//! chart session. A connection is replaced after a failed fetch.
 
 use crate::{
     Interval,
-    historical::{HistoricalClient, HistoricalRequest, HistoricalResult},
+    historical::{
+        HistoricalClient, HistoricalRequest, HistoricalResult,
+        client::{HistoricalConnection, is_connection_error},
+    },
 };
-use std::sync::Arc;
-use tokio::sync::Semaphore;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use tokio::sync::mpsc;
 use tracing::{debug, info, instrument, warn};
 
 // =============================================================================
@@ -39,7 +43,10 @@ pub struct BatchConfig {
     /// **Default: 4.**  Higher values may trigger TradingView rate-limiting.
     pub max_concurrency: usize,
 
-    /// Timeout per individual symbol fetch.
+    /// Time allowed for each wait of one symbol's fetch: connecting, the
+    /// initial series load, and each pagination page separately. It replaces
+    /// the template's `timeout`, so a paginated symbol can take longer than
+    /// this in total.
     ///
     /// **Default: 30 seconds.**
     pub per_symbol_timeout: std::time::Duration,
@@ -101,11 +108,8 @@ impl BatchResult {
 impl HistoricalClient {
     /// Fetch historical data for multiple symbols concurrently.
     ///
-    /// Each symbol is fetched independently via [`Self::retrieve`].  A
-    /// semaphore limits concurrency to `config.max_concurrency` to avoid
-    /// overwhelming the data server.  Per-symbol timeouts are enforced
-    /// individually; the overall call returns when **all** symbols have
-    /// completed or errored.
+    /// Equivalent to [`Self::retrieve_batch_with`] with a template that sets
+    /// only `interval` and `num_bars`.
     ///
     /// # Returns
     ///
@@ -134,6 +138,46 @@ impl HistoricalClient {
         num_bars: Option<u64>,
         config: BatchConfig,
     ) -> BatchResult {
+        let template = HistoricalRequest::builder()
+            .interval(interval)
+            .maybe_num_bars(num_bars)
+            .build();
+        self.retrieve_batch_with(symbols, &template, config).await
+    }
+
+    /// Fetch historical data for multiple symbols with the options of
+    /// `template`: interval, bar count, range, pagination, adjustment,
+    /// session and currency.
+    ///
+    /// The template's `ticker`, `symbol` and `exchange` are ignored, and
+    /// `config.per_symbol_timeout` replaces its `timeout`. At most
+    /// `config.max_concurrency` WebSocket connections are opened (at least
+    /// one, never more than there are symbols); each connection fetches
+    /// symbols one after another in separate chart sessions. A connection is
+    /// replaced after a connection failure or a timeout, and a symbol whose
+    /// fetch failed because the connection closed or could not be opened is
+    /// retried once on a fresh connection. The call returns when every symbol
+    /// succeeded or failed.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let template = HistoricalRequest::builder()
+    ///     .interval(Interval::OneHour)
+    ///     .from_timestamp(1_735_689_600)
+    ///     .adjustment(MarketAdjustment::Dividends)
+    ///     .build();
+    /// let result = client
+    ///     .retrieve_batch_with(&symbols, &template, BatchConfig::default())
+    ///     .await;
+    /// ```
+    #[instrument(skip(self, symbols, template), fields(symbol_count = symbols.len()))]
+    pub async fn retrieve_batch_with(
+        &self,
+        symbols: &[(String, String)],
+        template: &HistoricalRequest,
+        config: BatchConfig,
+    ) -> BatchResult {
         let started = std::time::Instant::now();
         let symbol_count = symbols.len();
 
@@ -146,77 +190,60 @@ impl HistoricalClient {
             };
         }
 
+        let workers = config.max_concurrency.clamp(1, symbol_count);
         info!(
-            "Starting batch retrieval: {} symbols, max_concurrency={}",
-            symbol_count, config.max_concurrency
+            "Starting batch retrieval: {} symbols, max_concurrency={}, connections={}",
+            symbol_count, config.max_concurrency, workers
         );
 
-        let semaphore = Arc::new(Semaphore::new(config.max_concurrency));
+        let template = HistoricalRequest {
+            timeout: config.per_symbol_timeout,
+            ..template.clone()
+        };
+        let queue = Arc::new(Mutex::new(symbols.iter().cloned().collect::<VecDeque<_>>()));
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
         let mut join_set = tokio::task::JoinSet::new();
-
-        for (symbol, exchange) in symbols {
-            let symbol = symbol.clone();
-            let exchange = exchange.clone();
-            let permit = Arc::clone(&semaphore);
-
-            let request = HistoricalRequest::builder()
-                .symbol(symbol.clone())
-                .exchange(exchange.clone())
-                .interval(interval)
-                .maybe_num_bars(num_bars)
-                .timeout(config.per_symbol_timeout)
-                .build();
-
-            // Each task gets its own HistoricalClient so concurrent
-            // WebSocket connections don't interfere.
-            let client = HistoricalClient::new(self.auth_token.clone(), self.server);
-
-            join_set.spawn(async move {
-                let _permit = permit.acquire().await;
-                debug!(
-                    symbol = %symbol,
-                    exchange = %exchange,
-                    "Fetching historical data"
-                );
-
-                let result = client.retrieve(request).await;
-
-                BatchSymbolResult {
-                    symbol: symbol.clone(),
-                    exchange: exchange.clone(),
-                    result,
-                }
-            });
+        for worker in 0..workers {
+            let worker_state = BatchWorker {
+                id: worker,
+                auth_token: self.auth_token.clone(),
+                server: self.server,
+                endpoint: self.endpoint.clone(),
+                template: template.clone(),
+                queue: Arc::clone(&queue),
+                results: result_tx.clone(),
+            };
+            join_set.spawn(worker_state.run());
         }
+        drop(result_tx);
 
         // Collect results in completion order.
         let mut successful = Vec::with_capacity(symbol_count);
         let mut failed = Vec::with_capacity(symbol_count);
-
-        while let Some(task_result) = join_set.join_next().await {
-            match task_result {
-                Ok(batch_result) => match &batch_result.result {
-                    Ok(hr) => {
-                        debug!(
-                            symbol = %batch_result.symbol,
-                            bars = hr.total_bars_received,
-                            elapsed_ms = hr.elapsed.as_millis(),
-                            "Symbol fetch complete"
-                        );
-                        successful.push(batch_result);
-                    }
-                    Err(e) => {
-                        warn!(
-                            symbol = %batch_result.symbol,
-                            error = %e,
-                            "Symbol fetch failed"
-                        );
-                        failed.push(batch_result);
-                    }
-                },
-                Err(join_err) => {
-                    warn!(error = %join_err, "Batch task panicked or was cancelled");
+        while let Some(batch_result) = result_rx.recv().await {
+            match &batch_result.result {
+                Ok(hr) => {
+                    debug!(
+                        symbol = %batch_result.symbol,
+                        bars = hr.total_bars_received,
+                        elapsed_ms = hr.elapsed.as_millis(),
+                        "Symbol fetch complete"
+                    );
+                    successful.push(batch_result);
                 }
+                Err(e) => {
+                    warn!(
+                        symbol = %batch_result.symbol,
+                        error = %e,
+                        "Symbol fetch failed"
+                    );
+                    failed.push(batch_result);
+                }
+            }
+        }
+        while let Some(joined) = join_set.join_next().await {
+            if let Err(join_err) = joined {
+                warn!(error = %join_err, "Batch worker panicked or was cancelled");
             }
         }
 
@@ -234,6 +261,94 @@ impl HistoricalClient {
             total_requested: symbol_count,
             elapsed,
         }
+    }
+}
+
+/// One batch worker: a connection that fetches queued symbols in turn.
+struct BatchWorker {
+    id: usize,
+    auth_token: String,
+    server: crate::DataServer,
+    endpoint: Option<url::Url>,
+    template: HistoricalRequest,
+    queue: Arc<Mutex<VecDeque<(String, String)>>>,
+    results: mpsc::UnboundedSender<BatchSymbolResult>,
+}
+
+impl BatchWorker {
+    fn next_symbol(&self) -> Option<(String, String)> {
+        self.queue.lock().unwrap().pop_front()
+    }
+
+    async fn run(self) {
+        let mut connection: Option<HistoricalConnection> = None;
+        while let Some((symbol, exchange)) = self.next_symbol() {
+            debug!(
+                worker = self.id,
+                symbol = %symbol,
+                exchange = %exchange,
+                "Fetching historical data"
+            );
+            let request = self.template.for_symbol(&symbol, &exchange);
+            let mut retried = false;
+            let result = loop {
+                let result = match self.connection(&mut connection).await {
+                    Ok(open) => open.fetch(&request).await,
+                    Err(error) => Err(error),
+                };
+                let Err(error) = &result else {
+                    break result;
+                };
+                let connection_failed = is_connection_error(error);
+                if (connection_failed || matches!(error, crate::Error::Timeout(_)))
+                    && let Some(failed) = connection.take()
+                {
+                    failed.close().await;
+                }
+                if connection_failed && !retried {
+                    retried = true;
+                    warn!(
+                        worker = self.id,
+                        symbol = %symbol,
+                        error = %error,
+                        "Connection failed; retrying the symbol once on a new connection"
+                    );
+                    continue;
+                }
+                break result;
+            };
+            // The receiver lives until every worker finished.
+            let _ = self.results.send(BatchSymbolResult {
+                symbol,
+                exchange,
+                result,
+            });
+        }
+        if let Some(open) = connection {
+            open.close().await;
+        }
+    }
+
+    /// The worker's open connection, opening a new one when needed.
+    async fn connection<'a>(
+        &self,
+        slot: &'a mut Option<HistoricalConnection>,
+    ) -> crate::Result<&'a HistoricalConnection> {
+        if let Some(stale) = slot.take_if(|open| open.is_closed()) {
+            stale.close().await;
+        }
+        if slot.is_none() {
+            *slot = Some(
+                HistoricalConnection::open(
+                    &self.auth_token,
+                    self.server,
+                    self.endpoint.as_ref(),
+                    self.template.timeout,
+                )
+                .await?,
+            );
+        }
+        Ok(slot.as_ref().expect("connection was opened above"))
     }
 }
 

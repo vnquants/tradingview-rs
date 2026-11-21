@@ -1,3 +1,41 @@
+//! TradingView data feed client: historical bars, live quotes and studies over
+//! TradingView's WebSocket protocol, plus its REST endpoints.
+//!
+//! # Logging
+//!
+//! The crate logs through [`tracing`]. Its own packet logs redact the
+//! parameters of `set_auth_token`, so the session token never appears in them,
+//! even at `TRACE`.
+//!
+//! The WebSocket transport, `tungstenite`, logs every frame it sends and
+//! receives at `TRACE` through the `log` crate, and the first frame carries
+//! the auth token. When `log` records are forwarded to your subscriber (as
+//! `tracing_subscriber::fmt().init()` and `tracing_log::LogTracer` do), cap
+//! `tungstenite` and `tokio_tungstenite` at `DEBUG` by appending
+//! [`RECOMMENDED_LOG_DIRECTIVES`] to your filter:
+//!
+//! ```no_run
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! use tracing_subscriber::{filter::Targets, prelude::*};
+//!
+//! let filter: Targets = format!("trace,{}", tradingview::RECOMMENDED_LOG_DIRECTIVES).parse()?;
+//! tracing_subscriber::registry()
+//!     .with(tracing_subscriber::fmt::layer())
+//!     .with(filter)
+//!     .init();
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! With `EnvFilter`, the same directives work in `RUST_LOG`, for example
+//! `RUST_LOG=trace,tungstenite=debug,tokio_tungstenite=debug`.
+
+/// Filter directives (`EnvFilter`/`Targets` syntax) that cap the WebSocket
+/// transport crates at `DEBUG`: at `TRACE` they log raw frames, including the
+/// `set_auth_token` frame with the session token. Append them to any filter
+/// that enables `TRACE`.
+pub const RECOMMENDED_LOG_DIRECTIVES: &str = "tungstenite=debug,tokio_tungstenite=debug";
+
 pub mod chart;
 pub mod client;
 pub mod error;

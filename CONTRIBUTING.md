@@ -37,7 +37,8 @@ pip install maturin pytest pytest-asyncio mypy ruff polars pandas
 maturin develop --release
 
 # Run python tests and linters
-pytest -v
+pytest -v                   # includes tests marked `network`, which call TradingView
+pytest -m "not network"     # offline tests only
 ruff check python tests
 mypy python/ tests/
 ```

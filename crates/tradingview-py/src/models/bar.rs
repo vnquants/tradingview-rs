@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::PyObject;
 use crate::models::enums::Interval;
+use crate::models::symbol::SymbolInfo;
 
 /// Individual historical OHLCV price bar.
 #[pyclass(name = "Bar", eq, from_py_object)]
@@ -82,18 +83,71 @@ pub struct HistoricalSeries {
     pub interval: Interval,
     #[pyo3(get)]
     pub bars: Vec<Bar>,
+    /// Symbol metadata from TradingView, when the series came from the server.
+    #[pyo3(get)]
+    pub symbol_info: Option<SymbolInfo>,
+    /// Number of `request_more_data` pages sent (0 without pagination).
+    #[pyo3(get)]
+    pub pages_fetched: u32,
+    /// Why pagination stopped (e.g. `"bar_limit"`), or None without pagination.
+    #[pyo3(get)]
+    pub pagination_stop: Option<String>,
+    /// Bar rows the server sent that could not be parsed and were dropped.
+    #[pyo3(get)]
+    pub dropped_rows: usize,
+    /// Whether the last bar had closed when the fetch finished; None when unknown.
+    #[pyo3(get)]
+    pub last_bar_complete: Option<bool>,
 }
 
 #[pymethods]
 impl HistoricalSeries {
     #[new]
-    pub fn new(symbol: String, exchange: String, interval: Interval, bars: Vec<Bar>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        symbol,
+        exchange,
+        interval,
+        bars,
+        *,
+        symbol_info = None,
+        pages_fetched = 0,
+        pagination_stop = None,
+        dropped_rows = 0,
+        last_bar_complete = None,
+    ))]
+    pub fn new(
+        symbol: String,
+        exchange: String,
+        interval: Interval,
+        bars: Vec<Bar>,
+        symbol_info: Option<SymbolInfo>,
+        pages_fetched: u32,
+        pagination_stop: Option<String>,
+        dropped_rows: usize,
+        last_bar_complete: Option<bool>,
+    ) -> Self {
         Self {
             symbol,
             exchange,
             interval,
             bars,
+            symbol_info,
+            pages_fetched,
+            pagination_stop,
+            dropped_rows,
+            last_bar_complete,
         }
+    }
+
+    /// True when no pagination was requested, or pagination reached
+    /// `from_timestamp`, `max_bars` or the start of the symbol's history.
+    #[getter]
+    pub fn is_complete(&self) -> bool {
+        matches!(
+            self.pagination_stop.as_deref(),
+            None | Some("reached_from" | "reached_max_bars" | "end_of_history")
+        )
     }
 
     pub fn __len__(&self) -> usize {

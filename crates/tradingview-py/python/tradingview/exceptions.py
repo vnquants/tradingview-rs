@@ -3,6 +3,7 @@
 from tradingview import (
     AuthenticationError,
     ConnectionError,
+    IncompleteHistoryError,
     ProtocolError,
     RateLimitError,
     SymbolNotFoundError,
@@ -13,6 +14,7 @@ from tradingview import (
 __all__ = [
     "AuthenticationError",
     "ConnectionError",
+    "IncompleteHistoryError",
     "ProtocolError",
     "RateLimitError",
     "SymbolNotFoundError",
