@@ -15,6 +15,7 @@ Thank you for your interest in contributing to `tradingview-rs`!
 git clone https://github.com/vnquants/tradingview-rs.git
 cd tradingview-rs
 cp .env.example .env  # fill in optional credentials for live tests
+pre-commit install    # fmt/ruff/prettier on staged files, then clippy, mypy, cargo test
 
 # Rust core
 cargo build --workspace --all-targets --all-features
@@ -51,6 +52,7 @@ mypy python/ tests/
 5. **Run checks** — `just checks` (or `cargo fmt -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo test --all-features`).
 6. **Sign commits** — All commits must be cryptographically signed with GPG or SSH (`git commit -S`).
 7. **Open a PR** — Reference the issue number in the description.
+
 ## Code Style
 
 - Follow [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/).
