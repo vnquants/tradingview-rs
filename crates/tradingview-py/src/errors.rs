@@ -12,6 +12,7 @@ create_exception!(tradingview, ConnectionError, TradingViewError);
 create_exception!(tradingview, TimeoutError, TradingViewError);
 create_exception!(tradingview, RateLimitError, TradingViewError);
 create_exception!(tradingview, ProtocolError, TradingViewError);
+create_exception!(tradingview, IncompleteHistoryError, TradingViewError);
 
 /// Register all exception classes on the Python module
 pub fn register_exceptions(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -22,6 +23,10 @@ pub fn register_exceptions(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<
     m.add("TimeoutError", py.get_type::<TimeoutError>())?;
     m.add("RateLimitError", py.get_type::<RateLimitError>())?;
     m.add("ProtocolError", py.get_type::<ProtocolError>())?;
+    m.add(
+        "IncompleteHistoryError",
+        py.get_type::<IncompleteHistoryError>(),
+    )?;
     Ok(())
 }
 

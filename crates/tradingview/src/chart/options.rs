@@ -237,7 +237,10 @@ impl ChartOptions {
                 if !Self::is_valid_identifier(exchange_part)
                     || !Self::is_valid_identifier(symbol_part)
                 {
-                    return Err("Exchange and symbol must contain only alphanumeric characters, hyphens, dots, and underscores".to_string());
+                    return Err(format!(
+                        "Exchange and symbol must contain only alphanumeric characters and {}",
+                        Self::ALLOWED_PUNCTUATION_DESCRIPTION
+                    ));
                 }
 
                 Ok((
@@ -259,7 +262,10 @@ impl ChartOptions {
                 }
 
                 if !Self::is_valid_identifier(symbol) || !Self::is_valid_identifier(exchange) {
-                    return Err("Symbol and exchange must contain only alphanumeric characters, hyphens, dots, and underscores".to_string());
+                    return Err(format!(
+                        "Symbol and exchange must contain only alphanumeric characters and {}",
+                        Self::ALLOWED_PUNCTUATION_DESCRIPTION
+                    ));
                 }
 
                 Ok((Some(Ustr::from(exchange)), Some(Ustr::from(symbol))))
@@ -278,18 +284,18 @@ impl ChartOptions {
         }
     }
 
+    /// Punctuation that appears in TradingView exchange and symbol names:
+    /// `.` (`OKX:BTCUSDT.P`, `NYSE:BRK.B`), `!` (continuous futures such as
+    /// `HNX:VN30F1!`), `_` (`FX_IDC`), `-` (`NSE:BAJAJ-AUTO`), `&`
+    /// (`NSE:M&M`), plus the characters accepted before.
+    const ALLOWED_PUNCTUATION: &'static [char] =
+        &['.', '!', '_', '-', '&', '$', '%', '#', '*', '(', ')', ':'];
+    const ALLOWED_PUNCTUATION_DESCRIPTION: &'static str = "the characters . ! _ - & $ % # * ( ) :";
+
     fn is_valid_identifier(s: &str) -> bool {
         !s.is_empty()
-            && s.chars().all(|c| {
-                c.is_alphanumeric()
-                    || c == '$'
-                    || c == '%'
-                    || c == '#'
-                    || c == '*'
-                    || c == '('
-                    || c == ')'
-                    || c == ':'
-            })
+            && s.chars()
+                .all(|c| c.is_alphanumeric() || Self::ALLOWED_PUNCTUATION.contains(&c))
     }
 
     pub fn interval(mut self, interval: Interval) -> Self {
@@ -350,5 +356,70 @@ impl ChartOptions {
             script_type,
         });
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_instrument_accepts_perpetual_suffix() {
+        let opts = ChartOptions::builder()
+            .instrument("OKX:BTCUSDT.P")
+            .build()
+            .expect("OKX:BTCUSDT.P is a valid TradingView symbol");
+        assert_eq!(opts.exchange.as_deref(), Some("OKX"));
+        assert_eq!(opts.symbol.as_deref(), Some("BTCUSDT.P"));
+    }
+
+    #[test]
+    fn test_instrument_accepts_continuous_futures() {
+        let opts = ChartOptions::builder()
+            .instrument("HOSE:VN30F1!")
+            .build()
+            .expect("HOSE:VN30F1! is a valid TradingView symbol");
+        assert_eq!(opts.exchange.as_deref(), Some("HOSE"));
+        assert_eq!(opts.symbol.as_deref(), Some("VN30F1!"));
+    }
+
+    #[test]
+    fn test_symbol_and_exchange_accept_tradingview_punctuation() {
+        for (symbol, exchange) in [
+            ("BTCUSDT.P", "OKX"),
+            ("VN30F1!", "HNX"),
+            ("BRK.B", "NYSE"),
+            ("USDVND", "FX_IDC"),
+            ("BAJAJ-AUTO", "NSE"),
+            ("M&M", "NSE"),
+        ] {
+            let opts = ChartOptions::builder()
+                .symbol(symbol)
+                .exchange(exchange)
+                .build()
+                .unwrap_or_else(|e| panic!("{exchange}:{symbol} rejected: {e:?}"));
+            assert_eq!(opts.symbol.as_deref(), Some(symbol));
+            assert_eq!(opts.exchange.as_deref(), Some(exchange));
+        }
+    }
+
+    #[test]
+    fn test_instrument_still_rejects_invalid_characters() {
+        for instrument in ["BINANCE:BTC USDT", "BINANCE:BTC/USDT", "BINANCE:BTC\"USDT"] {
+            assert!(
+                ChartOptions::builder()
+                    .instrument(instrument)
+                    .build()
+                    .is_err(),
+                "{instrument} should be rejected"
+            );
+        }
+        assert!(
+            ChartOptions::builder()
+                .instrument("BTCUSDT.P")
+                .build()
+                .is_err()
+        );
+        assert!(ChartOptions::builder().instrument("OKX:").build().is_err());
     }
 }

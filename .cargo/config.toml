@@ -1,2 +1,3 @@
 [env]
-RUST_LOG = { value = "debug" }
+# Keep tungstenite at DEBUG or below: at TRACE it logs raw frames, including the auth token.
+RUST_LOG = { value = "debug,tungstenite=debug,tokio_tungstenite=debug" }

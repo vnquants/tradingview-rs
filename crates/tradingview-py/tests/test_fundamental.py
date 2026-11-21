@@ -47,6 +47,7 @@ def test_fundamental_series_methods() -> None:
     assert d["value"] == [100.0, 150.0]
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_get_fundamental() -> None:
     client = TradingViewClient()
@@ -67,6 +68,7 @@ async def test_get_fundamental() -> None:
     await client.close()
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_get_fundamental_polars_dataframe() -> None:
     import polars as pl

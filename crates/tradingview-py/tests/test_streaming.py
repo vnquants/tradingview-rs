@@ -74,6 +74,7 @@ async def test_callback_validation_rejects_coroutine() -> None:
     await client.close()
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_quote_streaming_async_iter_and_callback() -> None:
     client = TradingViewClient()
@@ -100,6 +101,7 @@ async def test_quote_streaming_async_iter_and_callback() -> None:
         assert t.price > 0 or (t.bid is not None and t.bid > 0)
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_candle_streaming_async_iter() -> None:
     client = TradingViewClient()

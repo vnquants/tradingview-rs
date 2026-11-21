@@ -332,3 +332,128 @@ impl From<tradingview::live::models::DataServer> for DataServer {
         }
     }
 }
+
+/// Price adjustment applied to historical bars.
+///
+/// When no adjustment is passed, TradingView applies `Splits`.
+#[pyclass(eq, eq_int, from_py_object)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum MarketAdjustment {
+    /// Adjust for splits and stock dividends (the server default).
+    #[default]
+    Splits,
+    /// Adjust for splits and cash dividends.
+    Dividends,
+    /// Raw traded prices (wire value `none`).
+    Unadjusted,
+}
+
+#[pymethods]
+impl MarketAdjustment {
+    #[getter]
+    pub fn value(&self) -> &'static str {
+        self.as_str()
+    }
+
+    #[getter]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Splits => "Splits",
+            Self::Dividends => "Dividends",
+            Self::Unadjusted => "Unadjusted",
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<MarketAdjustment.{}: '{}'>", self.name(), self.value())
+    }
+
+    fn __str__(&self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl MarketAdjustment {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Splits => "splits",
+            Self::Dividends => "dividends",
+            Self::Unadjusted => "none",
+        }
+    }
+}
+
+impl From<MarketAdjustment> for tradingview::models::MarketAdjustment {
+    fn from(adjustment: MarketAdjustment) -> Self {
+        match adjustment {
+            MarketAdjustment::Splits => tradingview::models::MarketAdjustment::Splits,
+            MarketAdjustment::Dividends => tradingview::models::MarketAdjustment::Dividends,
+            MarketAdjustment::Unadjusted => tradingview::models::MarketAdjustment::Unadjusted,
+        }
+    }
+}
+
+/// Trading session of historical bars.
+///
+/// When no session is passed, TradingView returns `Regular` bars.
+#[pyclass(eq, eq_int, from_py_object)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum SessionType {
+    /// Regular trading hours (the server default).
+    #[default]
+    Regular,
+    /// Regular hours plus pre- and post-market.
+    Extended,
+    /// Pre-market only.
+    PreMarket,
+    /// Post-market only.
+    PostMarket,
+}
+
+#[pymethods]
+impl SessionType {
+    #[getter]
+    pub fn value(&self) -> &'static str {
+        self.as_str()
+    }
+
+    #[getter]
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Regular => "Regular",
+            Self::Extended => "Extended",
+            Self::PreMarket => "PreMarket",
+            Self::PostMarket => "PostMarket",
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("<SessionType.{}: '{}'>", self.name(), self.value())
+    }
+
+    fn __str__(&self) -> &'static str {
+        self.as_str()
+    }
+}
+
+impl SessionType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Regular => "regular",
+            Self::Extended => "extended",
+            Self::PreMarket => "premarket",
+            Self::PostMarket => "postmarket",
+        }
+    }
+}
+
+impl From<SessionType> for tradingview::models::SessionType {
+    fn from(session: SessionType) -> Self {
+        match session {
+            SessionType::Regular => tradingview::models::SessionType::Regular,
+            SessionType::Extended => tradingview::models::SessionType::Extended,
+            SessionType::PreMarket => tradingview::models::SessionType::PreMarket,
+            SessionType::PostMarket => tradingview::models::SessionType::PostMarket,
+        }
+    }
+}

@@ -288,8 +288,21 @@ pub fn format_packet<T: Serialize>(packet: T) -> Result<Message> {
     let json_string = serde_json::to_string(&packet)?;
     let utf16_len = json_string.encode_utf16().count();
     let formatted_message = format!("~m~{}~m~{}", utf16_len, json_string);
-    debug!("Formatted packet: {}", formatted_message);
+    debug!(
+        "Formatted packet: {}",
+        redact_packet_for_log(&formatted_message)
+    );
     Ok(Message::Text(formatted_message.into()))
+}
+
+/// Packet text that is safe to log: the parameters of `set_auth_token`,
+/// which carry the session token, are replaced by `<redacted>`.
+pub(crate) fn redact_packet_for_log(packet: &str) -> &str {
+    if packet.contains("set_auth_token") {
+        r#"{"m":"set_auth_token","p":["<redacted>"]}"#
+    } else {
+        packet
+    }
 }
 
 #[builder]
@@ -876,6 +889,26 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────
+    // log redaction
+    // -----------------------------------------------------------------------
+
+    /// A JWT-shaped token like the ones `/quote_token/` returns.
+    const REAL_LOOKING_TOKEN: &str = "eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9.\
+        eyJ1c2VyX2lkIjo0MiwiZXhwIjoxNzk1MTE4MDAyLCJwbGFuIjoicHJvIn0.\
+        c2lnbmF0dXJlLXNlY3JldC12YWx1ZS10aGF0LW11c3Qtbm90LWxlYWs";
+
+    #[test]
+    fn redact_packet_for_log_leaves_other_packets_alone() {
+        let packet = r#"~m~40~m~{"m":"chart_create_session","p":["cs_1",""]}"#;
+        assert_eq!(redact_packet_for_log(packet), packet);
+        assert!(
+            !redact_packet_for_log(&format!(
+                r#"~m~9~m~{{"m":"set_auth_token","p":["{REAL_LOOKING_TOKEN}"]}}"#
+            ))
+            .contains(REAL_LOOKING_TOKEN)
+        );
+    }
+
     // symbol_init
     // ──────────────────────────────────────────────────────────────────
 

@@ -5,15 +5,19 @@
 //!
 //! ```text
 //! HistoricalClient::retrieve(request)
-//!   ├── HistoricalRequest  (what to fetch)
+//!   ├── HistoricalRequest  (what to fetch, pagination, adjustment, session, currency)
 //!   ├── HistoricalState    (mutable state during fetch)
-//!   └── returns HistoricalResult
+//!   ├── create_series, then request_more_data pages when pagination is enabled
+//!   └── returns HistoricalResult (bars, SymbolInfo, pages_fetched, pagination_stop)
 //!
-//! HistoricalClient::retrieve_batch(symbols, interval, num_bars, config)
-//!   ├── Runs N concurrent HistoricalClient::retrieve() calls
-//!   ├── Semaphore-controlled concurrency
+//! HistoricalClient::retrieve_batch_with(symbols, template, config)
+//!   ├── At most `max_concurrency` connections, each fetching symbols in turn
+//!   ├── One chart session per symbol, routed by session id
 //!   └── returns BatchResult (successful + failed)
 //! ```
+//!
+//! See [`HistoricalRequest`] for the pagination stop conditions and
+//! `docs/history-depth.md` for how far back each data server goes.
 //!
 //! # Migration from v1
 //!
@@ -24,8 +28,7 @@
 //!
 //! The old batch implementation used a complex `CommandRunner` +
 //! `BatchTracker` + `DataRx` architecture.  The new `retrieve_batch()`
-//! uses `JoinSet` + `Semaphore` for dramatically simpler concurrent
-//! fetching.
+//! uses a `JoinSet` of workers that share a symbol queue.
 
 pub mod batch;
 pub mod client;
@@ -36,5 +39,8 @@ pub mod state;
 // Re-export the public API.
 pub use batch::{BatchConfig, BatchResult, BatchSymbolResult};
 pub use client::HistoricalClient;
-pub use request::HistoricalRequest;
-pub use result::HistoricalResult;
+pub use request::{
+    DEFAULT_MAX_PAGES, DEFAULT_PAGE_DELAY, DEFAULT_PAGE_SIZE, HistoricalRequest,
+    MAX_FROM_TIMESTAMP, PaginationPlan,
+};
+pub use result::{HistoricalResult, PaginationStop};

@@ -60,6 +60,19 @@ pub(crate) struct ErrorRecoveryConfig {
     health_check_interval: Duration,
 }
 
+impl ErrorRecoveryConfig {
+    /// Configuration for a one-shot connection (historical fetches): never
+    /// reconnect, because a new connection has none of the old chart
+    /// sessions, and give up connecting after `connection_timeout`.
+    pub(crate) fn one_shot(connection_timeout: Duration) -> Self {
+        Self {
+            max_recovery_attempts: 0,
+            connection_timeout,
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for ErrorRecoveryConfig {
     fn default() -> Self {
         Self {
@@ -279,6 +292,9 @@ pub struct WebSocketClient<T: Handler> {
     // Circuit breaker state
     circuit_breaker_open: Arc<AtomicBool>,
     circuit_breaker_opened_at: Arc<RwLock<Option<Instant>>>,
+
+    /// WebSocket URL override; `None` uses `wss://{server}.tradingview.com/socket.io/websocket`.
+    endpoint: Option<Url>,
 }
 
 /// Stops a [`WebSocketClient`]'s background tasks on drop.
@@ -311,6 +327,12 @@ impl<T: Handler> WebSocketClient<T> {
     ///
     /// In accordance with TradingView's protocol, if `auth_token` is `None` or omitted,
     /// the anonymous default token (`"unauthorized_user_token"`) is transmitted.
+    ///
+    /// `endpoint` replaces the default `wss://{server}.tradingview.com/socket.io/websocket`
+    /// URL, for example to reach a proxy or a local test server. It must be `wss://`, or
+    /// `ws://` on a loopback host (see [`validate_endpoint`]); the auth token is sent to it.
+    /// Connecting, including the WebSocket handshake, is bounded by the error
+    /// configuration's connection timeout (30 s by default).
     #[builder]
     pub async fn new(
         auth_token: Option<&str>,
@@ -318,14 +340,25 @@ impl<T: Handler> WebSocketClient<T> {
         handler: T,
         #[builder(default = 1024*1024)] buffer_size: usize,
         #[builder(default)] error_config: ErrorRecoveryConfig,
+        endpoint: Option<Url>,
     ) -> Result<Arc<Self>> {
-        let (write, read) = Self::connect(server, Some(buffer_size)).await?;
+        if let Some(endpoint) = &endpoint {
+            validate_endpoint(endpoint)?;
+        }
+        let (write, read) = Self::connect(
+            server,
+            Some(buffer_size),
+            endpoint.as_ref(),
+            error_config.connection_timeout,
+        )
+        .await?;
         Self::init_with_stream(
             handler,
             server,
             auth_token,
             buffer_size,
             error_config,
+            endpoint,
             write,
             read,
         )
@@ -334,12 +367,14 @@ impl<T: Handler> WebSocketClient<T> {
 
     /// Internal initialization with pre-connected WebSocket stream sink and stream.
     /// Performs initial authentication and starts health monitoring before returning.
+    #[allow(clippy::too_many_arguments)]
     async fn init_with_stream(
         handler: T,
         server: DataServer,
         auth_token: Option<&str>,
         buffer_size: usize,
         error_config: ErrorRecoveryConfig,
+        endpoint: Option<Url>,
         write: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
         read: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     ) -> Result<Arc<Self>> {
@@ -368,6 +403,7 @@ impl<T: Handler> WebSocketClient<T> {
             health_metrics: Arc::new(RwLock::new(HealthMetrics::default())),
             circuit_breaker_open: Arc::new(AtomicBool::new(false)),
             circuit_breaker_opened_at: Arc::new(RwLock::new(None)),
+            endpoint,
         });
 
         // Spawn the dedicated writer task.
@@ -479,13 +515,18 @@ impl<T: Handler> WebSocketClient<T> {
     async fn connect(
         server: DataServer,
         buffer_size: Option<usize>,
+        endpoint: Option<&Url>,
+        connect_timeout: Duration,
     ) -> Result<(
         SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
         SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
     )> {
-        let url = Url::parse(&format!(
-            "wss://{server}.tradingview.com/socket.io/websocket"
-        ))?;
+        let url = match endpoint {
+            Some(endpoint) => endpoint.clone(),
+            None => Url::parse(&format!(
+                "wss://{server}.tradingview.com/socket.io/websocket"
+            ))?,
+        };
 
         let buffer_size = buffer_size.unwrap_or(1024 * 1024);
 
@@ -497,7 +538,16 @@ impl<T: Handler> WebSocketClient<T> {
             .read_buffer_size(buffer_size)
             .write_buffer_size(buffer_size);
 
-        let (socket, response) = connect_async_with_config(request, Some(conf), false).await?;
+        let (socket, response) = timeout(
+            connect_timeout,
+            connect_async_with_config(request, Some(conf), false),
+        )
+        .await
+        .map_err(|_| {
+            Error::WebSocket(ustr(&format!(
+                "timed out after {connect_timeout:?} connecting to the data server"
+            )))
+        })??;
 
         info!("WebSocket connected with status: {}", response.status());
 
@@ -752,7 +802,14 @@ impl<T: Handler> WebSocketClient<T> {
     fn spawn_health_monitor(self: &Arc<Self>) {
         let client = Arc::clone(self);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(client.error_config.health_check_interval);
+            // First check one interval after connecting: an immediate ping
+            // races the session commands and, if the server closes right after
+            // answering, can make it reset the connection before its last
+            // frames are read.
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + client.error_config.health_check_interval,
+                client.error_config.health_check_interval,
+            );
 
             loop {
                 tokio::select! {
@@ -846,7 +903,13 @@ impl<T: Handler> WebSocketClient<T> {
         }
         drop(wh);
 
-        let (write, read) = Self::connect(self.server, Some(self.buffer_size)).await?;
+        let (write, read) = Self::connect(
+            self.server,
+            Some(self.buffer_size),
+            self.endpoint.as_ref(),
+            self.error_config.connection_timeout,
+        )
+        .await?;
 
         // Create a new channel and spawn a new writer task.
         let (new_tx, new_rx) = mpsc::channel(1024);
@@ -1399,7 +1462,14 @@ impl<T: Handler> Socket for WebSocketClient<T> {
     ) -> Result<()> {
         trace!("WebSocket event loop started");
 
-        let mut ping_interval = tokio::time::interval(self.error_config.ping_interval);
+        // The first ping goes out one interval after the loop starts; an
+        // immediate ping right after connecting is useless and, on a
+        // connection the server has already closed, fails the write and
+        // marks the client closed before buffered frames are read.
+        let mut ping_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + self.error_config.ping_interval,
+            self.error_config.ping_interval,
+        );
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -1433,9 +1503,9 @@ impl<T: Handler> Socket for WebSocketClient<T> {
                                 ustr("event_loop_read"),
                             ).await?;
 
-                            // For connection errors, we should break the loop
-                            if e.to_string().contains("ConnectionClosed") ||
-                               e.to_string().contains("ConnectionReset") {
+                            // The connection is gone: stop reading.
+                            if is_terminal_read_error(&e) {
+                                self.is_closed.store(true, Ordering::Relaxed);
                                 break;
                             }
                         }
@@ -1625,8 +1695,52 @@ impl<T: Handler> Socket for WebSocketClient<T> {
     }
 }
 
+/// Check a WebSocket endpoint override: `wss://` is required, except that
+/// `ws://` is accepted for a loopback host (`localhost`, `127.0.0.0/8`, `::1`),
+/// so the auth token is never sent in clear text over a network.
+pub fn validate_endpoint(endpoint: &Url) -> Result<()> {
+    let loopback = match endpoint.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    match endpoint.scheme() {
+        "wss" if endpoint.host().is_some() => Ok(()),
+        "ws" if loopback => Ok(()),
+        "ws" => Err(Error::UrlParse(ustr(&format!(
+            "endpoint {endpoint} must use wss://; ws:// is accepted only for a loopback host"
+        )))),
+        scheme => Err(Error::UrlParse(ustr(&format!(
+            "endpoint must be a wss:// URL (or ws:// on a loopback host), got scheme {scheme:?}"
+        )))),
+    }
+}
+
+/// Whether a read error means the connection cannot deliver more messages.
+fn is_terminal_read_error(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::{Error as WsError, error::ProtocolError};
+    matches!(
+        error,
+        WsError::ConnectionClosed
+            | WsError::AlreadyClosed
+            | WsError::Io(_)
+            | WsError::Protocol(
+                ProtocolError::ResetWithoutClosingHandshake | ProtocolError::SendAfterClosing
+            )
+    )
+}
+
 /// Route a decoded socket message through the handler's event and quote callbacks.
 pub fn dispatch_message_data<H: Handler>(handler: &H, message: SocketMessageDe) {
+    let server_time_ms = if message.t_ms > 0 {
+        Some(message.t_ms)
+    } else {
+        message.t.checked_mul(1_000).filter(|ms| *ms > 0)
+    };
+    if let Some(server_time_ms) = server_time_ms {
+        handler.handle_server_time(server_time_ms);
+    }
     let event = TradingViewDataEvent::from(message.m);
     handler.handle_events(event, &message.p);
     if event == TradingViewDataEvent::OnQuoteData {
@@ -1849,6 +1963,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_connect_times_out_when_handshake_never_answers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let holder = tokio::spawn(async move {
+            // Accept TCP but never answer the WebSocket handshake.
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            drop(stream);
+        });
+        let endpoint = Url::parse(&format!("ws://{server_addr}/socket.io/websocket")).unwrap();
+        let started = Instant::now();
+        let result = WebSocketClient::builder()
+            .handler(MockHandler::new())
+            .endpoint(endpoint)
+            .error_config(ErrorRecoveryConfig::one_shot(Duration::from_millis(200)))
+            .build()
+            .await;
+        holder.abort();
+
+        let error = result.err().expect("handshake must time out");
+        assert!(matches!(error, Error::WebSocket(_)), "{error}");
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_validate_endpoint_requires_tls_off_loopback() {
+        for ok in [
+            "wss://data.tradingview.com/socket.io/websocket",
+            "wss://proxy.example.com:8443/ws",
+            "ws://127.0.0.1:9000/socket.io/websocket",
+            "ws://127.10.0.1:9000/",
+            "ws://localhost:9000/",
+            "ws://[::1]:9000/",
+        ] {
+            assert!(validate_endpoint(&Url::parse(ok).unwrap()).is_ok(), "{ok}");
+        }
+        for bad in [
+            "ws://proxy.example.com/ws",
+            "ws://10.0.0.5:9000/",
+            "ws://[2001:db8::1]:9000/",
+            "https://data.tradingview.com/socket.io/websocket",
+            "http://127.0.0.1:9000/",
+        ] {
+            assert!(
+                validate_endpoint(&Url::parse(bad).unwrap()).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dispatch_passes_server_time_to_the_handler() {
+        struct TimeHandler(std::sync::Mutex<Vec<u64>>);
+        impl Handler for TimeHandler {
+            fn handle_events(&self, _: TradingViewDataEvent, _: &[Value]) {}
+            fn handle_quote_data(&self, _: &[Value]) {}
+            fn handle_series_data(&self, _: TradingViewDataEvent, _: &[Value]) {}
+            fn notify_error(&self, _: Error, _: &[Value]) {}
+            fn handle_server_time(&self, server_time_ms: u64) {
+                self.0.lock().unwrap().push(server_time_ms);
+            }
+        }
+        let handler = TimeHandler(std::sync::Mutex::new(Vec::new()));
+        for (t, t_ms) in [
+            (1_750_870_230, 1_750_870_230_451),
+            (1_750_870_231, 0),
+            (0, 0),
+        ] {
+            dispatch_message_data(
+                &handler,
+                SocketMessageDe {
+                    m: ustr("series_loading"),
+                    p: vec![],
+                    t,
+                    t_ms,
+                },
+            );
+        }
+        assert_eq!(
+            *handler.0.lock().unwrap(),
+            vec![1_750_870_230_451, 1_750_870_231_000]
+        );
+    }
+
+    #[test]
+    fn test_terminal_read_errors() {
+        use tokio_tungstenite::tungstenite::{Error as WsError, error::ProtocolError};
+        assert!(is_terminal_read_error(&WsError::ConnectionClosed));
+        assert!(is_terminal_read_error(&WsError::AlreadyClosed));
+        assert!(is_terminal_read_error(&WsError::Protocol(
+            ProtocolError::ResetWithoutClosingHandshake
+        )));
+        assert!(is_terminal_read_error(&WsError::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        ))));
+        assert!(!is_terminal_read_error(&WsError::Utf8(String::new())));
+    }
+
+    #[tokio::test]
     async fn test_local_ws_peer_observes_auth_first_and_session_order() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
@@ -1875,6 +2089,7 @@ mod tests {
             Some("test_token_secret"),
             1024 * 1024,
             ErrorRecoveryConfig::default(),
+            None,
             write,
             read,
         )
@@ -1944,6 +2159,7 @@ mod tests {
             None,
             1024 * 1024,
             ErrorRecoveryConfig::default(),
+            None,
             write,
             read,
         )
@@ -1977,6 +2193,7 @@ mod tests {
             None,
             1024 * 1024,
             ErrorRecoveryConfig::default(),
+            None,
             write,
             read,
         )
@@ -2076,6 +2293,7 @@ mod tests {
             None,
             1024 * 1024,
             ErrorRecoveryConfig::default(),
+            None,
             write,
             read,
         )

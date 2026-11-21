@@ -75,6 +75,7 @@ def test_historical_series_methods() -> None:
         pass
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_get_historical_single_symbol() -> None:
     client = TradingViewClient()
@@ -91,6 +92,7 @@ async def test_get_historical_single_symbol() -> None:
     await client.close()
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_get_historical_batch() -> None:
     client = TradingViewClient()
@@ -107,6 +109,7 @@ async def test_get_historical_batch() -> None:
     await client.close()
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_get_historical_polars_dataframe() -> None:
     import polars as pl
@@ -132,6 +135,7 @@ async def test_get_historical_polars_dataframe() -> None:
     await client.close()
 
 
+@pytest.mark.network
 @pytest.mark.asyncio
 async def test_get_historical_batch_polars_dataframe() -> None:
     import polars as pl
